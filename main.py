@@ -1,6 +1,6 @@
 """
 IG Markets Spread Betting - Telegram Reporting Bot
-Reports on open positions, balance, and account summary from an IG demo account.
+Button-driven UI. No need to type slash commands.
 """
 
 import os
@@ -9,17 +9,17 @@ from datetime import datetime
 from typing import Optional
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 from trading_ig import IGService
-from trading_ig.config import config as ig_config_module  # noqa: F401
 
 # ---------- Setup ----------
 load_dotenv()
@@ -28,7 +28,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-# Silence overly chatty libs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("trading_ig").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -39,13 +38,11 @@ ALLOWED_CHAT_ID = int(os.environ["ALLOWED_CHAT_ID"])
 IG_USERNAME = os.environ["IG_USERNAME"]
 IG_PASSWORD = os.environ["IG_PASSWORD"]
 IG_API_KEY = os.environ["IG_API_KEY"]
-IG_ACC_TYPE = os.environ.get("IG_ACC_TYPE", "DEMO")  # DEMO or LIVE
+IG_ACC_TYPE = os.environ.get("IG_ACC_TYPE", "DEMO")
 
 
-# ---------- IG session management ----------
+# ---------- IG session ----------
 class IGSession:
-    """Holds a logged-in IGService and re-logs in if the session dies."""
-
     def __init__(self) -> None:
         self._svc: Optional[IGService] = None
 
@@ -62,7 +59,6 @@ class IGSession:
         logger.info("IG login OK.")
 
     def call(self, fn_name: str, *args, **kwargs):
-        """Call a method on IGService; on auth failure, re-login once and retry."""
         try:
             return getattr(self.get(), fn_name)(*args, **kwargs)
         except Exception as e:
@@ -76,20 +72,46 @@ class IGSession:
 
 ig = IGSession()
 
+
 # ---------- Access control ----------
-def restricted(func):
-    """Reject any chat that isn't the configured owner."""
+def is_allowed(update: Update) -> bool:
+    return bool(update.effective_chat and update.effective_chat.id == ALLOWED_CHAT_ID)
 
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.effective_chat or update.effective_chat.id != ALLOWED_CHAT_ID:
-            chat_id = update.effective_chat.id if update.effective_chat else "?"
-            logger.warning("Blocked access from chat_id=%s", chat_id)
-            if update.message:
-                await update.message.reply_text("⛔ Access denied.")
-            return
-        return await func(update, context)
 
-    return wrapper
+# ---------- Keyboards ----------
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📊 Positions", callback_data="positions"),
+                InlineKeyboardButton("💼 Balance", callback_data="balance"),
+            ],
+            [
+                InlineKeyboardButton("📈 Summary", callback_data="summary"),
+                InlineKeyboardButton("🏓 Ping", callback_data="ping"),
+            ],
+            [
+                InlineKeyboardButton("🔄 Refresh menu", callback_data="menu"),
+            ],
+        ]
+    )
+
+
+def back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔄 Refresh", callback_data="refresh"),
+                InlineKeyboardButton("🔙 Back to menu", callback_data="menu"),
+            ]
+        ]
+    )
+
+
+MENU_TEXT = (
+    "🤖 *IG Spread Bet Reporter*\n\n"
+    "Tap a button below to see your account info."
+)
 
 
 # ---------- Formatting helpers ----------
@@ -102,46 +124,17 @@ def direction_emoji(d: str) -> str:
     return "🟢" if d.upper() == "BUY" else "🔴"
 
 
-# ---------- Command handlers ----------
-@restricted
-async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "👋 *IG Spread Bet Reporter*\n\n"
-        "Commands:\n"
-        "• /positions — open positions with P&L\n"
-        "• /balance — account balance & margin\n"
-        "• /summary — totals at a glance\n"
-        "• /ping — check the bot is alive"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-
-@restricted
-async def cmd_ping(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(f"pong 🏓  ({datetime.utcnow():%H:%M:%S} UTC)")
-
-
-@restricted
-async def cmd_positions(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.chat.send_action("typing")
-    try:
-        df = ig.call("fetch_open_positions")
-    except Exception as e:
-        logger.exception("fetch_open_positions failed")
-        await update.message.reply_text(f"❌ Error fetching positions:\n`{e}`",
-                                        parse_mode=ParseMode.MARKDOWN)
-        return
-
+# ---------- Data formatting ----------
+def build_positions_text() -> str:
+    df = ig.call("fetch_open_positions")
     if df is None or df.empty:
-        await update.message.reply_text("📭 No open positions.")
-        return
+        return "📭 *No open positions.*"
 
     lines = [f"📊 *Open positions ({len(df)})*\n"]
     total_pnl = 0.0
     currency = ""
 
     for _, row in df.iterrows():
-        # The IG response merges 'position' and 'market' columns; trading_ig flattens them.
         name = row.get("instrumentName") or row.get("epic", "?")
         direction = str(row.get("direction", "")).upper()
         size = float(row.get("dealSize", 0) or 0)
@@ -152,9 +145,7 @@ async def cmd_positions(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         limit = row.get("limitLevel")
         currency = row.get("currency") or currency
 
-        # Current price depends on direction (close BUY at bid, close SELL at offer)
         cur_price = bid if direction == "BUY" else offer
-        # P&L in account currency for spread bet = (cur - open) * size  (BUY)
         if direction == "BUY":
             pnl = (cur_price - open_lvl) * size
         else:
@@ -179,23 +170,13 @@ async def cmd_positions(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
     total_emoji = "🟢" if total_pnl >= 0 else "🔴"
     lines.append(f"\n{total_emoji} *Total P&L:* `{fmt_money(total_pnl, currency)}`")
+    return "\n".join(lines)
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
-
-@restricted
-async def cmd_balance(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.chat.send_action("typing")
-    try:
-        accounts = ig.call("fetch_accounts")
-    except Exception as e:
-        logger.exception("fetch_accounts failed")
-        await update.message.reply_text(f"❌ Error: `{e}`", parse_mode=ParseMode.MARKDOWN)
-        return
-
+def build_balance_text() -> str:
+    accounts = ig.call("fetch_accounts")
     if accounts is None or accounts.empty:
-        await update.message.reply_text("No accounts returned.")
-        return
+        return "No accounts returned."
 
     lines = ["💼 *Accounts*\n"]
     for _, acc in accounts.iterrows():
@@ -214,61 +195,144 @@ async def cmd_balance(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             f"   Margin used: `{fmt_money(deposit, currency)}`\n"
             f"   Open P&L: `{fmt_money(pnl, currency)}`\n"
         )
+    return "\n".join(lines)
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
-
-@restricted
-async def cmd_summary(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.chat.send_action("typing")
-    try:
-        positions = ig.call("fetch_open_positions")
-        accounts = ig.call("fetch_accounts")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: `{e}`", parse_mode=ParseMode.MARKDOWN)
-        return
+def build_summary_text() -> str:
+    positions = ig.call("fetch_open_positions")
+    accounts = ig.call("fetch_accounts")
 
     n_pos = 0 if positions is None or positions.empty else len(positions)
-    total_pnl = 0.0
+    total_pnl = balance = available = 0.0
     currency = ""
+
     if accounts is not None and not accounts.empty:
-        # Use the preferred account if marked, otherwise the first
-        preferred = accounts[accounts.get("preferred") == True] if "preferred" in accounts.columns else None
-        acc = preferred.iloc[0] if preferred is not None and not preferred.empty else accounts.iloc[0]
+        if "preferred" in accounts.columns:
+            preferred_rows = accounts[accounts["preferred"] == True]
+            acc = preferred_rows.iloc[0] if not preferred_rows.empty else accounts.iloc[0]
+        else:
+            acc = accounts.iloc[0]
         total_pnl = float(acc.get("profitLoss", 0) or 0)
         balance = float(acc.get("balance", 0) or 0)
         available = float(acc.get("available", 0) or 0)
         currency = acc.get("currency", "")
-    else:
-        balance = available = 0.0
 
     emoji = "🟢" if total_pnl >= 0 else "🔴"
-    text = (
+    return (
         f"📈 *Account summary*\n\n"
         f"Open positions: *{n_pos}*\n"
         f"Balance: `{fmt_money(balance, currency)}`\n"
         f"Available: `{fmt_money(available, currency)}`\n"
         f"{emoji} P&L: `{fmt_money(total_pnl, currency)}`"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
-async def on_unknown(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat and update.effective_chat.id == ALLOWED_CHAT_ID:
-        await update.message.reply_text("Unknown command. Try /start.")
+def build_ping_text() -> str:
+    return f"🏓 *pong*\nServer time: `{datetime.utcnow():%Y-%m-%d %H:%M:%S} UTC`"
+
+
+# Map callback_data → builder function
+ACTIONS = {
+    "positions": build_positions_text,
+    "balance": build_balance_text,
+    "summary": build_summary_text,
+    "ping": build_ping_text,
+}
+
+
+# ---------- Handlers ----------
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the main menu (on /start, /menu, or a 'menu' button press)."""
+    if not is_allowed(update):
+        if update.message:
+            await update.message.reply_text("⛔ Access denied.")
+        return
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            MENU_TEXT,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu_keyboard(),
+        )
+    elif update.message:
+        await update.message.reply_text(
+            MENU_TEXT,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu_keyboard(),
+        )
+
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle every inline-keyboard button tap."""
+    query = update.callback_query
+    if not is_allowed(update):
+        if query:
+            await query.answer("Access denied.", show_alert=True)
+        return
+
+    await query.answer()  # dismiss the spinner on the button
+
+    action = query.data
+
+    # Menu / back
+    if action == "menu":
+        await show_menu(update, context)
+        return
+
+    # Refresh — re-run whatever the user last looked at
+    if action == "refresh":
+        last = context.user_data.get("last_action")
+        if not last:
+            await show_menu(update, context)
+            return
+        action = last
+
+    builder = ACTIONS.get(action)
+    if not builder:
+        await show_menu(update, context)
+        return
+
+    context.user_data["last_action"] = action
+    try:
+        text = builder()
+    except Exception as e:
+        logger.exception("Action %s failed", action)
+        text = f"❌ *Error*\n`{e}`"
+
+    try:
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_keyboard(),
+        )
+    except Exception as e:
+        # If new text is identical to old (user mashed Refresh), Telegram errors. Just ignore.
+        if "not modified" in str(e).lower():
+            await query.answer("Already up to date ✓")
+        else:
+            raise
+
+
+async def on_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Any text the user types just brings the menu back."""
+    await show_menu(update, context)
 
 
 # ---------- Main ----------
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_start))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("positions", cmd_positions))
-    app.add_handler(CommandHandler("balance", cmd_balance))
-    app.add_handler(CommandHandler("summary", cmd_summary))
-    app.add_handler(MessageHandler(filters.COMMAND, on_unknown))
+    # /start, /menu, /help all show the menu
+    app.add_handler(CommandHandler("start", show_menu))
+    app.add_handler(CommandHandler("menu", show_menu))
+    app.add_handler(CommandHandler("help", show_menu))
+
+    # All button presses
+    app.add_handler(CallbackQueryHandler(on_button))
+
+    # Any text or unknown command -> show menu
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_any_text))
+    app.add_handler(MessageHandler(filters.COMMAND, on_any_text))
 
     logger.info("Bot starting (polling)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
