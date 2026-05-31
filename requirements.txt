@@ -1,5 +1,0 @@
-python-telegram-bot==21.6
-trading-ig==0.0.23
-pandas>=2.0
-python-dotenv==1.0.1
-requests>=2.31
