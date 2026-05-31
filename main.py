@@ -376,6 +376,7 @@ def main_menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     if is_admin(chat_id):
         rows.append([InlineKeyboardButton("📋 Copy positions", callback_data="pick:copy")])
         rows.append([InlineKeyboardButton("🔴 Close positions", callback_data="pick:close")])
+        rows.append([InlineKeyboardButton("🛡 Stop loss monitor", callback_data="sl_menu")])
         rows.append([InlineKeyboardButton("🔍 Explore (oil options)", callback_data="explore_menu")])
         rows.append([InlineKeyboardButton("👥 Manage members", callback_data="members")])
     rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="menu")])
@@ -2017,6 +2018,253 @@ def explore_sample_prices(login: IGLogin, epics: List[str]) -> str:
 
 
 # ============================================================
+# STOP LOSS MONITOR
+# ============================================================
+# A background task that watches a list of positions across all configured
+# logins. For each watched position, the user has set a loss limit (in the
+# account's currency). When the live P&L drops below -limit, the position
+# is closed at market and the admin is notified.
+#
+# The monitor list lives in memory only — restarts clear it. That's fine
+# for now; we picked the simpler model.
+
+# Each watch: {
+#   "watch_id": str (uuid-like),
+#   "login_idx": int,
+#   "account_id": str,
+#   "deal_id": str,
+#   "instrument_name": str,
+#   "loss_limit": float,     # positive number, e.g. 300.0
+#   "added_at": float (epoch seconds),
+# }
+SL_WATCHES: List[Dict[str, Any]] = []
+SL_TASK_HANDLE = None  # asyncio.Task once started
+SL_BOT = None  # Bot reference for sending notifications
+
+
+def sl_make_watch_id() -> str:
+    """Short unique id (12 hex chars)."""
+    import uuid
+    return uuid.uuid4().hex[:12]
+
+
+def sl_find_watch(watch_id: str) -> Optional[Dict[str, Any]]:
+    for w in SL_WATCHES:
+        if w["watch_id"] == watch_id:
+            return w
+    return None
+
+
+def sl_remove_watch(watch_id: str) -> bool:
+    """Remove a watch by id. Returns True if removed."""
+    for i, w in enumerate(SL_WATCHES):
+        if w["watch_id"] == watch_id:
+            SL_WATCHES.pop(i)
+            return True
+    return False
+
+
+def sl_current_pnl(login: IGLogin, account_id: str, deal_id: str) -> Tuple[Optional[float], Optional[Any], str]:
+    """
+    Look up the watched position on the account and compute its P&L.
+    Returns (pnl, position_row, currency). pnl=None means the position
+    is no longer open. Uses the bid/offer-from-entry method (the same one
+    used elsewhere in the bot) for consistency.
+    """
+    login.call("switch_account", account_id, False)
+    df = login.call("fetch_open_positions")
+    if df is None or df.empty:
+        return None, None, ""
+
+    match = df[df["dealId"] == deal_id] if "dealId" in df.columns else None
+    if match is None or match.empty:
+        return None, None, ""
+    row = match.iloc[0]
+    f = extract_position_fields(row)
+    size = f["size"]
+    open_lvl = f["open_level"]
+    direction = f["direction"]
+    bid = f["bid"]
+    offer = f["offer"]
+    currency = f["currency"] or ""
+    cur_price = bid if direction == "BUY" else offer
+    if direction == "BUY":
+        pnl = (cur_price - open_lvl) * size
+    else:
+        pnl = (open_lvl - cur_price) * size
+    return pnl, row, currency
+
+
+async def sl_check_one(watch: Dict[str, Any]) -> None:
+    """
+    Check a single watch. If loss > limit, close the position and notify admin.
+    If the position is no longer open, remove the watch silently.
+    """
+    global SL_WATCHES
+    try:
+        login = registry.by_idx(watch["login_idx"])
+    except Exception as e:
+        logger.warning("SL watch %s: cannot resolve login: %s", watch["watch_id"], e)
+        return
+
+    try:
+        pnl, row, currency = sl_current_pnl(login, watch["account_id"], watch["deal_id"])
+    except Exception as e:
+        logger.warning("SL watch %s: pnl check failed: %s", watch["watch_id"], e)
+        return
+
+    if pnl is None:
+        # Position no longer exists — auto-remove
+        logger.info("SL watch %s: position gone, removing", watch["watch_id"])
+        sl_remove_watch(watch["watch_id"])
+        if SL_BOT:
+            try:
+                await SL_BOT.send_message(
+                    ADMIN_CHAT_ID,
+                    f"🛡 _Stop-loss watch removed_\n"
+                    f"*{md_safe(watch['instrument_name'])}* — position no longer open.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+        return
+
+    # If loss is deeper than the limit (i.e. pnl <= -limit), trigger
+    limit = float(watch["loss_limit"])
+    if pnl <= -limit:
+        logger.warning(
+            "SL TRIGGERED watch=%s instrument=%s pnl=%.2f limit=-%.2f",
+            watch["watch_id"], watch["instrument_name"], pnl, limit,
+        )
+        # Close the position
+        try:
+            ok, msg = close_position(login, row)
+        except Exception as e:
+            ok, msg = False, f"exception: {e}"
+
+        sl_remove_watch(watch["watch_id"])
+        if SL_BOT:
+            status_emoji = "✅" if ok else "❌"
+            try:
+                await SL_BOT.send_message(
+                    ADMIN_CHAT_ID,
+                    (
+                        f"🛡 *STOP-LOSS TRIGGERED*\n\n"
+                        f"*{md_safe(watch['instrument_name'])}*\n"
+                        f"   Loss: `{fmt_money(pnl, currency)}`\n"
+                        f"   Limit: `-{fmt_money(limit, currency)}`\n\n"
+                        f"{status_emoji} Close result: {msg}"
+                    ),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception as e:
+                logger.exception("SL notification failed: %s", e)
+
+
+async def sl_monitor_loop():
+    """Background task: every 60 seconds, check all SL watches."""
+    import asyncio
+    logger.info("SL monitor loop started")
+    while True:
+        try:
+            # Iterate over a copy because checks may modify SL_WATCHES
+            for w in list(SL_WATCHES):
+                try:
+                    await sl_check_one(w)
+                except Exception as e:
+                    logger.exception("SL check_one error: %s", e)
+        except Exception as e:
+            logger.exception("SL loop iteration error: %s", e)
+        await asyncio.sleep(60)
+
+
+# ---------- SL UI ----------
+def sl_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("➕ Add position to monitor", callback_data="sl_add_pick_login")],
+        [InlineKeyboardButton("📋 Active monitors", callback_data="sl_list")],
+        [InlineKeyboardButton("🔙 Back to menu", callback_data="menu")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def sl_list_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for w in SL_WATCHES:
+        label = f"❌ {w['instrument_name'][:25]} (limit £{w['loss_limit']:g})"
+        rows.append([InlineKeyboardButton(label, callback_data=f"sl_remove:{w['watch_id']}")])
+    if not SL_WATCHES:
+        rows.append([InlineKeyboardButton("(no active monitors)", callback_data="sl_menu")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="sl_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def sl_pick_login_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for idx, login in registry.enumerate():
+        rows.append([InlineKeyboardButton(f"🔐 {login.label}", callback_data=f"sl_pick_acc:{idx}")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="sl_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def sl_pick_account_keyboard(login_idx: int, accounts_df) -> InlineKeyboardMarkup:
+    rows = []
+    if accounts_df is not None and not accounts_df.empty:
+        for _, acc in accounts_df.iterrows():
+            acc_id = acc.get("accountId")
+            label = acc_label(acc, short=True)
+            rows.append([
+                InlineKeyboardButton(label, callback_data=f"sl_pick_pos:{login_idx}:{acc_id}")
+            ])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="sl_add_pick_login")])
+    return InlineKeyboardMarkup(rows)
+
+
+def sl_pick_position_keyboard(login_idx: int, account_id: str, df) -> InlineKeyboardMarkup:
+    rows = []
+    if df is not None and not df.empty:
+        for _, row in df.iterrows():
+            f = extract_position_fields(row)
+            label = f"{direction_emoji(f['direction'])} {f['instrument_name'][:25]} ({f['direction']} {f['size']:g})"
+            rows.append([
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"sl_pick_limit:{login_idx}:{account_id}:{f['deal_id']}",
+                )
+            ])
+    rows.append([
+        InlineKeyboardButton("🔙 Back", callback_data=f"sl_pick_acc:{login_idx}")
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def sl_build_list_text() -> str:
+    if not SL_WATCHES:
+        return "📋 *Stop-loss monitors*\n\n_No active monitors._"
+    lines = [f"🛡 *Active monitors* ({len(SL_WATCHES)})\n"]
+    lines.append("_Tap a monitor below to remove it._\n")
+    for w in SL_WATCHES:
+        try:
+            login = registry.by_idx(w["login_idx"])
+            login_label = login.label
+        except Exception:
+            login_label = "?"
+        lines.append(
+            f"━━━━━━━━━━\n"
+            f"*{md_safe(w['instrument_name'])}*\n"
+            f"   🔐 {md_safe(login_label)}\n"
+            f"   🏦 `{w['account_id']}`\n"
+            f"   🛑 Loss limit: `£{w['loss_limit']:g}`"
+        )
+    return "\n".join(lines)
+
+
+# State for the multi-step "add monitor" wizard, keyed by chat_id.
+# Holds: {step, login_idx, account_id, deal_id, instrument_name}
+SL_WIZARD_STATE: Dict[int, Dict[str, Any]] = {}
+
+
+# ============================================================
 # BANNER MESSAGE HELPERS
 # ============================================================
 async def send_or_edit_banner(
@@ -3028,6 +3276,175 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await send_or_edit_banner(update, context, "accounts", text, kb)
         return
 
+    # ===== STOP-LOSS HANDLERS (admin only) =====
+    if data == "sl_menu":
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        SL_WIZARD_STATE.pop(chat.id, None)
+        text = (
+            "🛡 *Stop-loss monitor*\n\n"
+            f"_{len(SL_WATCHES)} active monitor(s)._\n\n"
+            "Add a position to watch with a loss limit in pounds.\n"
+            "If the live loss exceeds the limit, the bot will close it at market "
+            "and send you a notification.\n\n"
+            "_Checks run every 60 seconds. Monitor list is cleared on bot restart._"
+        )
+        await send_or_edit_banner(update, context, "accounts", text, sl_menu_keyboard())
+        return
+
+    if data == "sl_list":
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        await send_or_edit_banner(
+            update, context, "accounts", sl_build_list_text(), sl_list_keyboard()
+        )
+        return
+
+    if data.startswith("sl_remove:"):
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        watch_id = data.split(":", 1)[1]
+        w = sl_find_watch(watch_id)
+        if w:
+            sl_remove_watch(watch_id)
+            await query.answer(f"Removed: {w['instrument_name'][:30]}")
+            logger.info("SL watch removed by admin: %s", watch_id)
+        else:
+            await query.answer("Not found.", show_alert=True)
+        await send_or_edit_banner(
+            update, context, "accounts", sl_build_list_text(), sl_list_keyboard()
+        )
+        return
+
+    if data == "sl_add_pick_login":
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        SL_WIZARD_STATE[chat.id] = {"step": "login"}
+        await send_or_edit_banner(
+            update, context, "picker_login",
+            "🛡 *Add monitor — step 1 of 4*\n\nPick the login:",
+            sl_pick_login_keyboard(),
+        )
+        return
+
+    if data.startswith("sl_pick_acc:"):
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        login_idx = int(data.split(":", 1)[1])
+        SL_WIZARD_STATE[chat.id] = {"step": "account", "login_idx": login_idx}
+        login = registry.by_idx(login_idx)
+        try:
+            accounts = login.call("fetch_accounts")
+        except Exception as e:
+            await send_or_edit_banner(
+                update, context, "error",
+                f"❌ *Error*\n`{md_safe(e)}`",
+                main_menu_keyboard(chat.id),
+            )
+            return
+        await send_or_edit_banner(
+            update, context, "picker_account",
+            f"🛡 *Add monitor — step 2 of 4*\n🔐 _Login:_ {md_safe(login.label)}\n\nPick the account:",
+            sl_pick_account_keyboard(login_idx, accounts),
+        )
+        return
+
+    if data.startswith("sl_pick_pos:"):
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        _, login_idx_s, account_id = data.split(":", 2)
+        login_idx = int(login_idx_s)
+        SL_WIZARD_STATE[chat.id] = {
+            "step": "position", "login_idx": login_idx, "account_id": account_id,
+        }
+        login = registry.by_idx(login_idx)
+        try:
+            login.call("switch_account", account_id, False)
+            df = login.call("fetch_open_positions")
+        except Exception as e:
+            await send_or_edit_banner(
+                update, context, "error",
+                f"❌ *Error*\n`{md_safe(e)}`",
+                main_menu_keyboard(chat.id),
+            )
+            return
+        if df is None or df.empty:
+            text = (
+                "🛡 *Add monitor — step 3 of 4*\n\n"
+                "📭 _No open positions in this account._"
+            )
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"sl_pick_acc:{login_idx}")]])
+            await send_or_edit_banner(update, context, "positions", text, kb)
+            return
+        # Filter out positions already being watched (avoid duplicates)
+        watched_deal_ids = {w["deal_id"] for w in SL_WATCHES}
+        df_filtered = df[~df["dealId"].isin(watched_deal_ids)] if "dealId" in df.columns else df
+        if df_filtered.empty:
+            text = (
+                "🛡 *Add monitor — step 3 of 4*\n\n"
+                "_All open positions are already being monitored._"
+            )
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"sl_pick_acc:{login_idx}")]])
+            await send_or_edit_banner(update, context, "positions", text, kb)
+            return
+        await send_or_edit_banner(
+            update, context, "positions",
+            "🛡 *Add monitor — step 3 of 4*\n\nPick a position to watch:",
+            sl_pick_position_keyboard(login_idx, account_id, df_filtered),
+        )
+        return
+
+    if data.startswith("sl_pick_limit:"):
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        _, login_idx_s, account_id, deal_id = data.split(":", 3)
+        login_idx = int(login_idx_s)
+        login = registry.by_idx(login_idx)
+        # Look up the position to display its details + remember it
+        try:
+            login.call("switch_account", account_id, False)
+            df = login.call("fetch_open_positions")
+            match = df[df["dealId"] == deal_id] if df is not None and "dealId" in df.columns else None
+            if match is None or match.empty:
+                raise RuntimeError("position not found")
+            row = match.iloc[0]
+            f = extract_position_fields(row)
+        except Exception as e:
+            await send_or_edit_banner(
+                update, context, "error",
+                f"❌ *Error*\n`{md_safe(e)}`",
+                main_menu_keyboard(chat.id),
+            )
+            return
+
+        SL_WIZARD_STATE[chat.id] = {
+            "step": "awaiting_limit",
+            "login_idx": login_idx,
+            "account_id": account_id,
+            "deal_id": deal_id,
+            "instrument_name": f["instrument_name"],
+        }
+        text = (
+            "🛡 *Add monitor — step 4 of 4*\n\n"
+            f"*{md_safe(f['instrument_name'])}*\n"
+            f"   {f['direction']}  size: `{f['size']:g}` @ `{f['open_level']:g}`\n\n"
+            "💬 _Now send the loss limit in pounds as a number._\n"
+            "_For example, send `300` to set a £300 stop-loss._\n\n"
+            "_The position will be closed at market when its loss meets or exceeds this number._"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛑 Cancel", callback_data="sl_menu")],
+        ])
+        await send_or_edit_banner(update, context, "positions", text, kb)
+        return
+
     await show_menu(update, context)
 
 
@@ -3035,10 +3452,54 @@ async def on_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat = update.effective_chat
     if not chat:
         return
-    # Check if we're awaiting explore epics input
+
+    # ===== Stop-loss wizard: awaiting limit number =====
+    if is_admin(chat.id) and update.message and update.message.text:
+        sl_state = SL_WIZARD_STATE.get(chat.id)
+        if sl_state and sl_state.get("step") == "awaiting_limit":
+            raw = update.message.text.strip().replace(",", ".")
+            # Strip optional currency symbols
+            for ch in ("£", "$", "€"):
+                raw = raw.replace(ch, "")
+            raw = raw.strip()
+            try:
+                limit = float(raw)
+                if limit <= 0:
+                    raise ValueError("must be positive")
+            except Exception:
+                await update.message.reply_text(
+                    "❌ Send a positive number (in pounds). For example: `300`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+            # Create the watch
+            w = {
+                "watch_id": sl_make_watch_id(),
+                "login_idx": sl_state["login_idx"],
+                "account_id": sl_state["account_id"],
+                "deal_id": sl_state["deal_id"],
+                "instrument_name": sl_state["instrument_name"],
+                "loss_limit": limit,
+                "added_at": datetime.utcnow().timestamp(),
+            }
+            SL_WATCHES.append(w)
+            SL_WIZARD_STATE.pop(chat.id, None)
+            logger.info(
+                "SL watch added: %s instrument=%s limit=£%.2f",
+                w["watch_id"], w["instrument_name"], limit,
+            )
+            await update.message.reply_text(
+                f"✅ *Monitor active*\n\n"
+                f"*{md_safe(w['instrument_name'])}*\n"
+                f"🛑 Loss limit: `£{limit:g}`\n\n"
+                "_The bot will check every 60 seconds and close at market if exceeded._",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+    # ===== Explore wizard: awaiting epics =====
     state = EXPLORE_STATE.get(chat.id, {})
     if state.get("awaiting") == "sample_epics" and update.message and update.message.text:
-        # Parse epics from the message
         lines = update.message.text.strip().splitlines()
         epics = []
         for ln in lines:
@@ -3053,13 +3514,23 @@ async def on_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"✅ Got {len(epics)} epic(s). Now pick a login from the previous menu to fetch prices."
             )
             return
+
     # Default fall-through: show menu
     await show_menu(update, context)
 
 
 # ---------- Main ----------
+async def _post_init(app):
+    """Called once after the application starts. Spins up the SL monitor."""
+    global SL_TASK_HANDLE, SL_BOT
+    SL_BOT = app.bot
+    import asyncio
+    SL_TASK_HANDLE = asyncio.create_task(sl_monitor_loop())
+    logger.info("Stop-loss monitor task scheduled")
+
+
 def main() -> None:
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", show_menu))
     app.add_handler(CommandHandler("menu", show_menu))
     app.add_handler(CommandHandler("help", show_menu))
