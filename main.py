@@ -1766,6 +1766,46 @@ def get_explore_state(chat_id: int) -> Dict[str, Any]:
     return EXPLORE_STATE.setdefault(chat_id, {})
 
 
+def md_safe(s: Any) -> str:
+    """
+    Escape Telegram-Markdown (legacy v1) special characters so user-supplied
+    or API-supplied strings don't break parsing. We escape:  _ * ` [
+    These are the ones that can open an unbalanced entity.
+    """
+    if s is None:
+        return ""
+    text = str(s)
+    return (
+        text
+        .replace("\\", "\\\\")
+        .replace("_", "\\_")
+        .replace("*", "\\*")
+        .replace("`", "\\`")
+        .replace("[", "\\[")
+    )
+
+
+def strip_markdown(s: str) -> str:
+    """Remove all markdown formatting characters as a last-resort fallback."""
+    if not s:
+        return ""
+    out = []
+    i = 0
+    while i < len(s):
+        c = s[i]
+        # Skip backslash-escapes (keep the next char only)
+        if c == "\\" and i + 1 < len(s):
+            out.append(s[i + 1])
+            i += 2
+            continue
+        if c in ("*", "_", "`", "[", "]"):
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 # ---------- Step 1: Search markets ----------
 def explore_search_oil(login: IGLogin) -> Tuple[str, List[Dict[str, Any]]]:
     """
@@ -1815,9 +1855,13 @@ def explore_search_oil(login: IGLogin) -> Tuple[str, List[Dict[str, Any]]]:
         "",
     ]
     for m in matches[:40]:
+        # Backticks around the epic are safe, but the epic itself should not contain backticks.
+        # Names are escaped to neutralise any _ * ` [ characters that would break Markdown.
+        epic_s = m["epic"].replace("`", "")
         lines.append(
-            f"• `{m['epic']}`\n"
-            f"   *{m['instrumentName']}*  ({m['instrumentType']}, expiry={m['expiry']}, status={m['marketStatus']})"
+            f"• `{epic_s}`\n"
+            f"   *{md_safe(m['instrumentName'])}*  "
+            f"({md_safe(m['instrumentType'])}, expiry={md_safe(m['expiry'])}, status={md_safe(m['marketStatus'])})"
         )
     if len(matches) > 40:
         lines.append(f"\n_... and {len(matches) - 40} more (not shown)_")
@@ -1892,21 +1936,23 @@ def explore_navigation(login: IGLogin, node_id: Optional[str] = None) -> Tuple[s
     if node_id is None:
         lines.append("🌳 *Navigation root*")
     else:
-        lines.append(f"🌳 *Node `{node_id}`*")
+        lines.append(f"🌳 *Node `{md_safe(node_id)}`*")
     lines.append("")
 
     if nodes:
         lines.append(f"📁 *Sub-categories* ({len(nodes)}):")
         for n in nodes[:30]:
-            lines.append(f"   `{n['id']}` — {n['name']}")
+            node_id_s = str(n.get("id", "?")).replace("`", "")
+            lines.append(f"   `{node_id_s}` — {md_safe(n.get('name', ''))}")
         if len(nodes) > 30:
             lines.append(f"   _...and {len(nodes) - 30} more_")
         lines.append("")
     if markets:
         lines.append(f"📈 *Markets here* ({len(markets)}):")
         for m in markets[:25]:
+            epic_s = str(m.get("epic", "?")).replace("`", "")
             lines.append(
-                f"   • `{m['epic']}`  *{m['instrumentName']}*"
+                f"   • `{epic_s}`  *{md_safe(m.get('instrumentName', ''))}*"
             )
         if len(markets) > 25:
             lines.append(f"   _...and {len(markets) - 25} more_")
@@ -1946,13 +1992,14 @@ def explore_sample_prices(login: IGLogin, epics: List[str]) -> str:
         return "_No epics to fetch (pass epics in chat or pick them via navigation)._"
     lines = [f"💰 *Sample prices* ({len(epics)} markets)\n"]
     for epic in epics[:30]:
+        epic_s = epic.replace("`", "")
         try:
             details = login.call("fetch_market_by_epic", epic)
         except Exception as e:
-            lines.append(f"• `{epic}` — ❌ {e}")
+            lines.append(f"• `{epic_s}` — ❌ {md_safe(e)}")
             continue
         if not isinstance(details, dict):
-            lines.append(f"• `{epic}` — (unexpected response shape)")
+            lines.append(f"• `{epic_s}` — (unexpected response shape)")
             continue
         instrument = details.get("instrument") or {}
         snapshot = details.get("snapshot") or {}
@@ -1962,8 +2009,9 @@ def explore_sample_prices(login: IGLogin, epics: List[str]) -> str:
         status = snapshot.get("marketStatus", "-")
         update_time = snapshot.get("updateTime", "-")
         lines.append(
-            f"• `{epic}`\n"
-            f"   *{name}*  bid=`{bid}` offer=`{offer}` ({status} {update_time})"
+            f"• `{epic_s}`\n"
+            f"   *{md_safe(name)}*  bid=`{bid}` offer=`{offer}` "
+            f"({md_safe(status)} {md_safe(update_time)})"
         )
     return "\n".join(lines)
 
@@ -1992,6 +2040,11 @@ async def send_or_edit_banner(
     fits_caption = len(text) <= MAX_TG_CAPTION
     is_callback = update.callback_query is not None
 
+    # Helper: detect Markdown-parse errors and retry as plain text
+    def _is_parse_error(e: Exception) -> bool:
+        m = str(e).lower()
+        return "can't parse entities" in m or "can't find end of the entity" in m
+
     # If text is too long for a caption, send/edit as plain text
     if not fits_caption:
         text_to_send = text[:MAX_TG_MSG] if len(text) > MAX_TG_MSG else text
@@ -2008,12 +2061,29 @@ async def send_or_edit_banner(
                 if "not modified" in msg:
                     await update.callback_query.answer("Already up to date ✓")
                     return
-                # Message was a photo — can't edit caption to plain text. Delete + resend.
+                if _is_parse_error(e):
+                    # Retry without markdown
+                    try:
+                        await update.callback_query.edit_message_text(
+                            strip_markdown(text_to_send), reply_markup=keyboard
+                        )
+                        return
+                    except Exception:
+                        pass
+                # Otherwise: message was a photo — delete and resend
                 try:
                     await update.callback_query.message.delete()
                 except Exception:
                     pass
-        await chat.send_message(text_to_send, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        try:
+            await chat.send_message(
+                text_to_send, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+            )
+        except Exception as e:
+            if _is_parse_error(e):
+                await chat.send_message(strip_markdown(text_to_send), reply_markup=keyboard)
+            else:
+                raise
         return
 
     # Text fits — try to use a banner
@@ -2023,7 +2093,6 @@ async def send_or_edit_banner(
 
         try:
             if is_callback:
-                # Try to edit current message's media to this banner with new caption
                 try:
                     sent = await update.callback_query.edit_message_media(
                         media=InputMediaPhoto(
@@ -2033,7 +2102,6 @@ async def send_or_edit_banner(
                         ),
                         reply_markup=keyboard,
                     )
-                    # Cache file_id after first upload
                     if not cached_id and sent and sent.photo:
                         _banner_file_ids[banner_key] = sent.photo[-1].file_id
                     return
@@ -2042,28 +2110,52 @@ async def send_or_edit_banner(
                     if "not modified" in msg:
                         await update.callback_query.answer("Already up to date ✓")
                         return
-                    # Previous message wasn't a photo (e.g. very first /start sent plain),
-                    # or some other edit failure — delete and resend.
+                    if _is_parse_error(e):
+                        # Retry the caption edit without markdown
+                        try:
+                            await update.callback_query.edit_message_caption(
+                                caption=strip_markdown(text),
+                                reply_markup=keyboard,
+                            )
+                            return
+                        except Exception:
+                            pass
+                    # Some other edit failure — delete and resend
                     try:
                         await update.callback_query.message.delete()
                     except Exception:
                         pass
-                    # Reopen file if needed (it may have been consumed)
                     if not isinstance(media_source, str):
                         media_source = open(banner_path, "rb")
 
-            # Fresh send (either /start or fallback from a failed edit)
-            sent = await chat.send_photo(
-                photo=media_source,
-                caption=text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=keyboard,
-            )
+            # Fresh send
+            try:
+                sent = await chat.send_photo(
+                    photo=media_source,
+                    caption=text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=keyboard,
+                )
+            except Exception as e:
+                if _is_parse_error(e):
+                    # Reopen file and retry without markdown
+                    if not isinstance(media_source, str):
+                        try:
+                            media_source.close()
+                        except Exception:
+                            pass
+                        media_source = open(banner_path, "rb")
+                    sent = await chat.send_photo(
+                        photo=media_source,
+                        caption=strip_markdown(text),
+                        reply_markup=keyboard,
+                    )
+                else:
+                    raise
             if not cached_id and sent.photo:
                 _banner_file_ids[banner_key] = sent.photo[-1].file_id
             return
         finally:
-            # Close file handle if we opened one
             if not isinstance(media_source, str):
                 try:
                     media_source.close()
@@ -2077,12 +2169,26 @@ async def send_or_edit_banner(
                 text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
             )
             return
-        except Exception:
+        except Exception as e:
+            if _is_parse_error(e):
+                try:
+                    await update.callback_query.edit_message_text(
+                        strip_markdown(text), reply_markup=keyboard
+                    )
+                    return
+                except Exception:
+                    pass
             try:
                 await update.callback_query.message.delete()
             except Exception:
                 pass
-    await chat.send_message(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+    try:
+        await chat.send_message(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+    except Exception as e:
+        if _is_parse_error(e):
+            await chat.send_message(strip_markdown(text), reply_markup=keyboard)
+        else:
+            raise
 
 
 # ============================================================
