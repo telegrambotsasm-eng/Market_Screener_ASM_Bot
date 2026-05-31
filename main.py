@@ -344,6 +344,7 @@ def main_menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
         ],
     ]
     if is_admin(chat_id):
+        rows.append([InlineKeyboardButton("🔴 Close positions", callback_data="pick:close")])
         rows.append([InlineKeyboardButton("👥 Manage members", callback_data="members")])
     rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="menu")])
     return InlineKeyboardMarkup(rows)
@@ -355,11 +356,16 @@ def login_picker_keyboard(action: str, chat_id: int) -> InlineKeyboardMarkup:
         rows.append(
             [InlineKeyboardButton(f"🔐 {login.label}", callback_data=f"pickacc:{action}:{idx}")]
         )
-    # Only show "All logins" if the user has access to more than one
     if len(registry.enumerate_for(chat_id)) > 1:
-        rows.append(
-            [InlineKeyboardButton("🌐 All logins (everything)", callback_data=f"run:{action}:ALL:ALL")]
-        )
+        if action == "close":
+            # Closing across everything is dangerous — route through confirmation
+            rows.append(
+                [InlineKeyboardButton("⚠️ Close EVERYTHING (all logins)", callback_data="confirm:close_everything")]
+            )
+        else:
+            rows.append(
+                [InlineKeyboardButton("🌐 All logins (everything)", callback_data=f"run:{action}:ALL:ALL")]
+            )
     rows.append([InlineKeyboardButton("🔙 Back to menu", callback_data="menu")])
     return InlineKeyboardMarkup(rows)
 
@@ -381,7 +387,6 @@ def members_menu_keyboard() -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("(no members configured)", callback_data="menu")])
     rows.append([InlineKeyboardButton("🔙 Back to menu", callback_data="menu")])
     return InlineKeyboardMarkup(rows)
-    return InlineKeyboardMarkup(rows)
 
 
 def account_picker_keyboard(action: str, login_idx: int, accounts_df) -> InlineKeyboardMarkup:
@@ -393,15 +398,35 @@ def account_picker_keyboard(action: str, login_idx: int, accounts_df) -> InlineK
             rows.append(
                 [InlineKeyboardButton(label, callback_data=f"run:{action}:{login_idx}:{acc_id}")]
             )
-    rows.append(
-        [InlineKeyboardButton("🌐 All accounts in this login", callback_data=f"run:{action}:{login_idx}:ALL")]
-    )
+    if action == "close":
+        # All accounts in login → confirm
+        rows.append(
+            [InlineKeyboardButton("⚠️ Close all in this login", callback_data=f"confirm:close_login:{login_idx}")]
+        )
+    else:
+        rows.append(
+            [InlineKeyboardButton("🌐 All accounts in this login", callback_data=f"run:{action}:{login_idx}:ALL")]
+        )
     rows.append([InlineKeyboardButton("🔙 Back to logins", callback_data=f"pick:{action}")])
     return InlineKeyboardMarkup(rows)
 
 
-def result_keyboard(action: str, login_idx) -> InlineKeyboardMarkup:
+def result_keyboard(action: str, login_idx, chat_id: int = 0, account_id: str = "") -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("🔄 Refresh", callback_data="refresh")]]
+    # Quick close shortcut from a Positions result (admin only, specific account)
+    if (
+        action == "positions"
+        and is_admin(chat_id)
+        and login_idx != "ALL"
+        and account_id
+        and account_id != "ALL"
+    ):
+        rows.append(
+            [InlineKeyboardButton(
+                "🔴 Close positions in this account",
+                callback_data=f"run:close:{login_idx}:{account_id}",
+            )]
+        )
     if login_idx != "ALL":
         rows.append(
             [
@@ -824,6 +849,205 @@ def build_accounts_list(chat_id: int) -> str:
 
 
 # ============================================================
+# CLOSE POSITIONS
+# ============================================================
+# All close paths flow:
+#   1. User taps a Close button (single, all-in-account, all-in-login, everything)
+#   2. Bot shows confirmation screen with details + Yes/No buttons
+#   3. On Yes: bot calls IG's close API for every matching position
+#   4. Bot shows result (closed N, failed M, with details)
+
+
+def close_position(login: IGLogin, position_row) -> Tuple[bool, str]:
+    """
+    Close a single open position using the IG REST close-otc endpoint.
+    Returns (success, message). 'position_row' is one row from fetch_open_positions().
+    """
+    deal_id = position_row.get("dealId")
+    direction = str(position_row.get("direction", "")).upper()
+    size = float(position_row.get("dealSize", 0) or 0)
+    name = position_row.get("instrumentName") or position_row.get("epic", "?")
+
+    if not deal_id:
+        return False, f"{name}: missing dealId"
+
+    # To close, send the OPPOSITE direction at MARKET for the same size
+    opposite = "SELL" if direction == "BUY" else "BUY"
+
+    try:
+        result = login.call(
+            "close_open_position",
+            deal_id=deal_id,
+            direction=opposite,
+            epic=None,
+            expiry=None,
+            level=None,
+            order_type="MARKET",
+            quote_id=None,
+            size=size,
+        )
+        # trading-ig usually returns a confirmation dict
+        if isinstance(result, dict):
+            status = result.get("dealStatus") or result.get("status") or "OK"
+            reason = result.get("reason", "")
+            if status in ("ACCEPTED", "OK"):
+                return True, f"{name}: closed"
+            return False, f"{name}: {status} {reason}".strip()
+        return True, f"{name}: closed"
+    except Exception as e:
+        logger.exception("close_position failed for %s", name)
+        return False, f"{name}: {e}"
+
+
+def close_all_in_account(login: IGLogin, account_id: str) -> Tuple[int, int, List[str]]:
+    """Close every open position in one account. Returns (closed, failed, details)."""
+    login.call("switch_account", account_id, False)
+    df = login.call("fetch_open_positions")
+    if df is None or df.empty:
+        return 0, 0, ["_no open positions_"]
+
+    closed = 0
+    failed = 0
+    details = []
+    for _, row in df.iterrows():
+        ok, msg = close_position(login, row)
+        details.append(("✅ " if ok else "❌ ") + msg)
+        if ok:
+            closed += 1
+        else:
+            failed += 1
+    return closed, failed, details
+
+
+def close_all_in_login(login: IGLogin) -> Tuple[int, int, List[str]]:
+    """Close every open position in every account under this login."""
+    accounts = login.call("fetch_accounts")
+    if accounts is None or accounts.empty:
+        return 0, 0, ["_no accounts_"]
+
+    total_closed = 0
+    total_failed = 0
+    all_details = []
+    for _, acc in accounts.iterrows():
+        acc_id = acc.get("accountId")
+        alabel = acc_label(acc, short=True)
+        all_details.append(f"\n*🏦 {alabel}*")
+        try:
+            c, f, det = close_all_in_account(login, acc_id)
+        except Exception as e:
+            all_details.append(f"❌ account error: {e}")
+            continue
+        all_details.extend(det)
+        total_closed += c
+        total_failed += f
+    return total_closed, total_failed, all_details
+
+
+def close_everything(chat_id: int) -> Tuple[int, int, List[str]]:
+    """Close every position across every allowed login. Admin-only path."""
+    total_closed = 0
+    total_failed = 0
+    all_details = []
+    for _, login in registry.enumerate_for(chat_id):
+        all_details.append(f"\n═══════════════\n*🔐 {login.label}*")
+        try:
+            c, f, det = close_all_in_login(login)
+        except Exception as e:
+            all_details.append(f"❌ login error: {e}")
+            continue
+        all_details.extend(det)
+        total_closed += c
+        total_failed += f
+    return total_closed, total_failed, all_details
+
+
+# ---------- Close UI screens ----------
+def build_close_account_page(login: IGLogin, account_id: str) -> Tuple[str, InlineKeyboardMarkup]:
+    """Show every position in this account with a [Close] button each."""
+    login.call("switch_account", account_id, False)
+    df = login.call("fetch_open_positions")
+
+    accounts = login.call("fetch_accounts")
+    name = account_id
+    if accounts is not None and not accounts.empty:
+        m = accounts[accounts["accountId"] == account_id]
+        if not m.empty:
+            name = acc_label(m.iloc[0], short=True)
+
+    header = f"🔴 *Close positions*\n🔐 _Login:_ {login.label}\n🏦 _Account:_ {name}\n"
+
+    if df is None or df.empty:
+        text = header + "\n📭 _No open positions to close._"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back", callback_data="pick:close")],
+        ])
+        return text, kb
+
+    # Save the position list so the close confirmation can look it up by dealId
+    # We need login_idx so we can also pass that along — but the bot context
+    # already knows it from the pickacc step. We'll thread it through callbacks.
+
+    rows = []
+    body_lines = []
+    for _, row in df.iterrows():
+        deal_id = row.get("dealId", "?")
+        inst = row.get("instrumentName") or row.get("epic", "?")
+        direction = str(row.get("direction", "")).upper()
+        size = float(row.get("dealSize", 0) or 0)
+        bid = float(row.get("bid", 0) or 0)
+        offer = float(row.get("offer", 0) or 0)
+        open_lvl = float(row.get("openLevel", 0) or 0)
+        currency = row.get("currency", "")
+        cur_price = bid if direction == "BUY" else offer
+        pnl = (cur_price - open_lvl) * size if direction == "BUY" else (open_lvl - cur_price) * size
+        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+        dir_emoji = "🟢" if direction == "BUY" else "🔴"
+
+        body_lines.append(
+            f"{dir_emoji} *{inst}*  `{direction} {size:g}`\n"
+            f"   {pnl_emoji} `{fmt_money(pnl, currency)}`  •  `{deal_id}`"
+        )
+        # The close button — use dealId in the callback
+        rows.append([
+            InlineKeyboardButton(
+                f"❌ Close: {inst[:25]}",
+                callback_data=f"confirm:close_one:{deal_id}",
+            )
+        ])
+
+    # Find login index for the "close all in account" button
+    login_idx = None
+    for i, lg in registry.enumerate():
+        if lg is login:
+            login_idx = i
+            break
+
+    rows.append(
+        [InlineKeyboardButton(
+            "⚠️ Close ALL in this account",
+            callback_data=f"confirm:close_account:{login_idx}:{account_id}",
+        )]
+    )
+    rows.append([InlineKeyboardButton("🔙 Back to accounts", callback_data=f"pickacc:close:{login_idx}")])
+
+    return header + "\n" + "\n\n".join(body_lines), InlineKeyboardMarkup(rows)
+
+
+def confirmation_keyboard(yes_callback: str, no_callback: str = "menu") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ YES, close", callback_data=yes_callback)],
+        [InlineKeyboardButton("🛑 NO, cancel", callback_data=no_callback)],
+    ])
+
+
+# Storage for pending close confirmations.
+# Maps a token (chat_id+timestamp) to the details, but to keep things simple we
+# encode everything in the callback_data itself (dealId, login_idx, account_id).
+# For close_one, we need to look up the position again at confirm time to show
+# its current state. This is done in the handler.
+
+
+# ============================================================
 # BANNER MESSAGE HELPERS
 # ============================================================
 async def send_or_edit_banner(
@@ -1024,6 +1248,30 @@ async def run_action(
             text = build_balance(login_idx, account_id, chat.id)
         elif action == "summary":
             text = build_summary(login_idx, account_id, chat.id)
+        elif action == "close":
+            # Admin-only check
+            if not is_admin(chat.id):
+                await query.answer("⛔ Admin only.", show_alert=True)
+                return
+            # account_id can only be a real id here (ALL is routed through confirm)
+            if account_id == "ALL":
+                return  # safety: handled via confirm:close_login path
+            login = registry.by_idx(login_idx)
+            try:
+                text, kb = build_close_account_page(login, account_id)
+            except Exception as e:
+                logger.exception("close page failed")
+                await send_or_edit_banner(
+                    update, context, "error",
+                    f"*Error*\n`{e}`",
+                    main_menu_keyboard(chat.id),
+                )
+                return
+            # Remember context for confirmation step
+            context.user_data["close_login_idx"] = login_idx
+            context.user_data["close_account_id"] = account_id
+            await send_or_edit_banner(update, context, "positions", text, kb)
+            return
         else:
             text = "Unknown action."
     except Exception as e:
@@ -1031,11 +1279,14 @@ async def run_action(
         await send_or_edit_banner(
             update, context, "error",
             f"*Error*\n`{e}`",
-            result_keyboard(action, login_idx),
+            result_keyboard(action, login_idx, chat.id, account_id),
         )
         return
 
-    await send_or_edit_banner(update, context, action, text, result_keyboard(action, login_idx))
+    await send_or_edit_banner(
+        update, context, action, text,
+        result_keyboard(action, login_idx, chat.id, account_id),
+    )
 
 
 async def show_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1149,9 +1400,293 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             PAUSED.discard(member_chat_id)
             await query.answer(f"✅ Resumed: {name}")
             logger.info("Admin resumed member chat_id=%s (%s)", member_chat_id, name)
-        # Refresh the members screen so the button label updates
         await show_members(update, context)
         return
+
+    # ===== CLOSE: CONFIRMATION SCREENS =====
+    if data.startswith("confirm:"):
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        parts = data.split(":")
+        sub = parts[1]
+
+        if sub == "close_one":
+            deal_id = parts[2]
+            login_idx = context.user_data.get("close_login_idx")
+            account_id = context.user_data.get("close_account_id")
+            if login_idx is None or account_id is None:
+                await query.answer("Context lost. Restart from menu.", show_alert=True)
+                await show_menu(update, context)
+                return
+            login = registry.by_idx(login_idx)
+            # Re-fetch position to show current state on the confirm screen
+            try:
+                login.call("switch_account", account_id, False)
+                df = login.call("fetch_open_positions")
+            except Exception as e:
+                await send_or_edit_banner(
+                    update, context, "error",
+                    f"*Error*\n`{e}`", main_menu_keyboard(chat.id),
+                )
+                return
+            row = None
+            if df is not None and not df.empty:
+                match = df[df["dealId"] == deal_id]
+                if not match.empty:
+                    row = match.iloc[0]
+            if row is None:
+                await send_or_edit_banner(
+                    update, context, "error",
+                    "❌ *Position not found.*\nIt may have already closed.",
+                    main_menu_keyboard(chat.id),
+                )
+                return
+            inst = row.get("instrumentName") or row.get("epic", "?")
+            direction = str(row.get("direction", "")).upper()
+            size = float(row.get("dealSize", 0) or 0)
+            currency = row.get("currency", "")
+            bid = float(row.get("bid", 0) or 0)
+            offer = float(row.get("offer", 0) or 0)
+            open_lvl = float(row.get("openLevel", 0) or 0)
+            cur_price = bid if direction == "BUY" else offer
+            pnl = (cur_price - open_lvl) * size if direction == "BUY" else (open_lvl - cur_price) * size
+            pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+            text = (
+                "⚠️ *Confirm close*\n\n"
+                f"🔐 _Login:_ {login.label}\n\n"
+                f"*{inst}*\n"
+                f"   {direction}  size: `{size:g}` @ `{open_lvl:g}`\n"
+                f"   now: `{cur_price:g}`   {pnl_emoji} `{fmt_money(pnl, currency)}`\n\n"
+                f"_This will close the position at market._"
+            )
+            await send_or_edit_banner(
+                update, context, "error", text,
+                confirmation_keyboard(f"do:close_one:{deal_id}"),
+            )
+            return
+
+        if sub == "close_account":
+            login_idx = int(parts[2])
+            account_id = parts[3]
+            login = registry.by_idx(login_idx)
+            try:
+                login.call("switch_account", account_id, False)
+                df = login.call("fetch_open_positions")
+            except Exception as e:
+                await send_or_edit_banner(
+                    update, context, "error",
+                    f"*Error*\n`{e}`", main_menu_keyboard(chat.id),
+                )
+                return
+            count = 0 if df is None or df.empty else len(df)
+            if count == 0:
+                await send_or_edit_banner(
+                    update, context, "error",
+                    "📭 _No open positions to close._",
+                    main_menu_keyboard(chat.id),
+                )
+                return
+            accounts = login.call("fetch_accounts")
+            name = account_id
+            if accounts is not None and not accounts.empty:
+                m = accounts[accounts["accountId"] == account_id]
+                if not m.empty:
+                    name = acc_label(m.iloc[0], short=True)
+            text = (
+                "⚠️ *Confirm: Close ALL positions in account*\n\n"
+                f"🔐 _Login:_ {login.label}\n"
+                f"🏦 _Account:_ {name}\n\n"
+                f"*{count}* position(s) will be closed at market.\n\n"
+                "_This cannot be undone._"
+            )
+            await send_or_edit_banner(
+                update, context, "error", text,
+                confirmation_keyboard(f"do:close_account:{login_idx}:{account_id}"),
+            )
+            return
+
+        if sub == "close_login":
+            login_idx = int(parts[2])
+            login = registry.by_idx(login_idx)
+            try:
+                accounts = login.call("fetch_accounts")
+            except Exception as e:
+                await send_or_edit_banner(
+                    update, context, "error",
+                    f"*Error*\n`{e}`", main_menu_keyboard(chat.id),
+                )
+                return
+            # Count positions across all accounts in this login
+            total = 0
+            if accounts is not None and not accounts.empty:
+                for _, acc in accounts.iterrows():
+                    try:
+                        login.call("switch_account", acc.get("accountId"), False)
+                        df = login.call("fetch_open_positions")
+                        if df is not None and not df.empty:
+                            total += len(df)
+                    except Exception:
+                        pass
+            if total == 0:
+                await send_or_edit_banner(
+                    update, context, "error",
+                    "📭 _No open positions in this login._",
+                    main_menu_keyboard(chat.id),
+                )
+                return
+            text = (
+                "⚠️ *Confirm: Close ALL in login*\n\n"
+                f"🔐 _Login:_ {login.label}\n"
+                f"🏦 _Accounts:_ {len(accounts)}\n\n"
+                f"*{total}* position(s) across all accounts will be closed at market.\n\n"
+                "🚨 _This cannot be undone._"
+            )
+            await send_or_edit_banner(
+                update, context, "error", text,
+                confirmation_keyboard(f"do:close_login:{login_idx}"),
+            )
+            return
+
+        if sub == "close_everything":
+            # Count positions across all logins
+            total = 0
+            n_accounts = 0
+            for _, login in registry.enumerate_for(chat.id):
+                try:
+                    accounts = login.call("fetch_accounts")
+                except Exception:
+                    continue
+                if accounts is None or accounts.empty:
+                    continue
+                n_accounts += len(accounts)
+                for _, acc in accounts.iterrows():
+                    try:
+                        login.call("switch_account", acc.get("accountId"), False)
+                        df = login.call("fetch_open_positions")
+                        if df is not None and not df.empty:
+                            total += len(df)
+                    except Exception:
+                        pass
+            if total == 0:
+                await send_or_edit_banner(
+                    update, context, "error",
+                    "📭 _No open positions anywhere._",
+                    main_menu_keyboard(chat.id),
+                )
+                return
+            text = (
+                "🚨🚨 *DANGER: Close EVERYTHING* 🚨🚨\n\n"
+                f"_{len(registry.enumerate_for(chat.id))} login(s), {n_accounts} account(s)_\n\n"
+                f"*{total}* position(s) will be closed at market across **every** login.\n\n"
+                "🔴 _This will not be reversible._\n"
+                "🔴 _Are you absolutely sure?_"
+            )
+            await send_or_edit_banner(
+                update, context, "error", text,
+                confirmation_keyboard("do:close_everything"),
+            )
+            return
+
+    # ===== CLOSE: EXECUTE (after confirmation) =====
+    if data.startswith("do:"):
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        parts = data.split(":")
+        sub = parts[1]
+
+        # Show "working" state
+        try:
+            await query.edit_message_caption(
+                caption="⏳ *Closing positions...*",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            try:
+                await query.edit_message_text(
+                    "⏳ *Closing positions...*", parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception:
+                pass
+
+        if sub == "close_one":
+            deal_id = parts[2]
+            login_idx = context.user_data.get("close_login_idx")
+            account_id = context.user_data.get("close_account_id")
+            login = registry.by_idx(login_idx)
+            try:
+                login.call("switch_account", account_id, False)
+                df = login.call("fetch_open_positions")
+                row = df[df["dealId"] == deal_id].iloc[0] if df is not None and not df.empty else None
+                if row is None:
+                    raise RuntimeError("position not found")
+                ok, msg = close_position(login, row)
+            except Exception as e:
+                ok, msg = False, str(e)
+            logger.info("Close one by admin: ok=%s msg=%s", ok, msg)
+            emoji = "✅" if ok else "❌"
+            text = f"{emoji} *Close result*\n\n{msg}"
+            await send_or_edit_banner(
+                update, context, "main", text, main_menu_keyboard(chat.id)
+            )
+            return
+
+        if sub == "close_account":
+            login_idx = int(parts[2])
+            account_id = parts[3]
+            login = registry.by_idx(login_idx)
+            try:
+                closed, failed, details = close_all_in_account(login, account_id)
+            except Exception as e:
+                closed, failed, details = 0, 1, [str(e)]
+            logger.info("Close account by admin: closed=%d failed=%d", closed, failed)
+            text = (
+                f"*Close result — account*\n\n"
+                f"✅ Closed: {closed}\n"
+                f"❌ Failed: {failed}\n\n"
+                + "\n".join(details)
+            )
+            await send_or_edit_banner(
+                update, context, "main", text, main_menu_keyboard(chat.id)
+            )
+            return
+
+        if sub == "close_login":
+            login_idx = int(parts[2])
+            login = registry.by_idx(login_idx)
+            try:
+                closed, failed, details = close_all_in_login(login)
+            except Exception as e:
+                closed, failed, details = 0, 1, [str(e)]
+            logger.info("Close login by admin: closed=%d failed=%d", closed, failed)
+            text = (
+                f"*Close result — login {login.label}*\n\n"
+                f"✅ Closed: {closed}\n"
+                f"❌ Failed: {failed}\n\n"
+                + "\n".join(details)
+            )
+            await send_or_edit_banner(
+                update, context, "main", text, main_menu_keyboard(chat.id)
+            )
+            return
+
+        if sub == "close_everything":
+            try:
+                closed, failed, details = close_everything(chat.id)
+            except Exception as e:
+                closed, failed, details = 0, 1, [str(e)]
+            logger.warning("Close EVERYTHING by admin: closed=%d failed=%d", closed, failed)
+            text = (
+                f"*🚨 Close ALL result*\n\n"
+                f"✅ Closed: {closed}\n"
+                f"❌ Failed: {failed}\n\n"
+                + "\n".join(details)
+            )
+            await send_or_edit_banner(
+                update, context, "main", text, main_menu_keyboard(chat.id)
+            )
+            return
 
     await show_menu(update, context)
 
