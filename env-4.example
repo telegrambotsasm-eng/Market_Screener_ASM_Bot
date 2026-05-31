@@ -1,0 +1,7 @@
+# Telegram
+TELEGRAM_TOKEN=123456:ABC-your-bot-token-here
+ALLOWED_CHAT_ID=123456789
+
+# IG Logins (JSON array). Each entry = one separate IG login.
+# Tip: keep this all on one line in Railway; here multi-line for readability.
+IG_LOGINS=[{"label":"Demo 1","username":"user1","password":"pass1","api_key":"key1","acc_type":"DEMO"},{"label":"Demo 2","username":"user2","password":"pass2","api_key":"key2","acc_type":"DEMO"}]
