@@ -4,10 +4,15 @@ Multi-login + multi-account support, button-driven UI.
 """
 
 import os
+import sys
 import json
 import logging
+import warnings
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict, Any
+
+# Silence the harmless 'munch is not present' warning from trading-ig
+warnings.filterwarnings("ignore", message=".*munch.*")
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -45,23 +50,51 @@ def load_logins() -> List[Dict[str, Any]]:
     """Load multiple IG logins from the IG_LOGINS env var (JSON array)."""
     raw = os.environ.get("IG_LOGINS", "").strip()
     if not raw:
-        raise SystemExit(
-            "IG_LOGINS env var is empty. Set it to a JSON array of login objects."
-        )
+        print("=" * 60, file=sys.stderr)
+        print("❌ IG_LOGINS env var is empty.", file=sys.stderr)
+        print("Set it to a JSON array, e.g.:", file=sys.stderr)
+        print('   [{"label":"Demo","username":"X","password":"Y","api_key":"Z","acc_type":"DEMO"}]', file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+        # Sleep forever instead of crash-looping
+        import time; time.sleep(3600)
+        raise SystemExit(1)
+
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise SystemExit(f"IG_LOGINS is not valid JSON: {e}")
+        print("=" * 60, file=sys.stderr)
+        print(f"❌ IG_LOGINS is not valid JSON: {e}", file=sys.stderr)
+        print("First 200 chars of what you set:", file=sys.stderr)
+        print(f"   {raw[:200]!r}", file=sys.stderr)
+        print("Tip: make sure quotes are straight \" not curly \u201c \u201d", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+        import time; time.sleep(3600)
+        raise SystemExit(1)
 
     if not isinstance(data, list) or not data:
-        raise SystemExit("IG_LOGINS must be a non-empty JSON array.")
+        print("❌ IG_LOGINS must be a non-empty JSON array.", file=sys.stderr)
+        import time; time.sleep(3600)
+        raise SystemExit(1)
 
+    REQUIRED = ("username", "password", "api_key")
     for i, cfg in enumerate(data):
         if not isinstance(cfg, dict):
-            raise SystemExit(f"IG_LOGINS[{i}] must be an object")
-        for field in ("username", "password", "api_key"):
-            if not cfg.get(field):
-                raise SystemExit(f"IG_LOGINS[{i}] missing '{field}'")
+            print(f"❌ IG_LOGINS[{i}] must be an object, got {type(cfg).__name__}", file=sys.stderr)
+            import time; time.sleep(3600)
+            raise SystemExit(1)
+
+        keys_seen = list(cfg.keys())
+        missing = [f for f in REQUIRED if not cfg.get(f)]
+        if missing:
+            print("=" * 60, file=sys.stderr)
+            print(f"❌ IG_LOGINS[{i}] is missing required field(s): {missing}", file=sys.stderr)
+            print(f"   Fields I found in this entry: {keys_seen}", file=sys.stderr)
+            print(f"   Required field names (exact, case-sensitive): {list(REQUIRED)}", file=sys.stderr)
+            print(f"   Optional: 'label', 'acc_type'", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
+            import time; time.sleep(3600)
+            raise SystemExit(1)
+
         cfg.setdefault("acc_type", "DEMO")
         cfg.setdefault("label", cfg["username"])
 
