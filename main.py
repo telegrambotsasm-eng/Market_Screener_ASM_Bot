@@ -51,7 +51,8 @@ MAX_TG_CAPTION = 1000  # Telegram caption limit is 1024 — leave headroom
 MAX_TG_MSG = 4000      # Plain message limit is 4096
 
 # ---------- Banner paths ----------
-ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+# Banners live in the same directory as main.py (the repo root on Railway).
+ASSETS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 BANNERS = {
     "main": os.path.join(ASSETS_DIR, "banner_main.png"),
