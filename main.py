@@ -508,6 +508,64 @@ def members_text() -> str:
 
 
 # ---------- Position formatting ----------
+# Flag to log raw position structure only once (first time we see it)
+_position_structure_logged = False
+
+
+def get_field(row, *candidate_names, default=None):
+    """
+    Try several possible column names. Return the first non-null match.
+    trading-ig sometimes returns flat columns like 'dealSize', sometimes
+    namespaced like 'position.dealSize'.
+    """
+    for name in candidate_names:
+        if name in row.index if hasattr(row, "index") else name in row:
+            val = row.get(name)
+            # Skip NaN / None
+            try:
+                import pandas as pd
+                if val is None or (isinstance(val, float) and pd.isna(val)):
+                    continue
+            except ImportError:
+                if val is None:
+                    continue
+            return val
+    return default
+
+
+def extract_position_fields(row) -> Dict[str, Any]:
+    """
+    Pull the fields we care about from a position row, regardless of how
+    trading-ig has named the columns in this version.
+    """
+    global _position_structure_logged
+    if not _position_structure_logged:
+        try:
+            cols = list(row.index) if hasattr(row, "index") else list(row.keys())
+            logger.info("Position row columns: %s", cols)
+            # Show the actual values for inspection
+            sample = {c: row.get(c) for c in cols}
+            logger.info("Position row sample: %r", sample)
+            _position_structure_logged = True
+        except Exception as e:
+            logger.warning("Could not log position structure: %s", e)
+
+    return {
+        "deal_id": get_field(row, "dealId", "position.dealId"),
+        "instrument_name": get_field(row, "instrumentName", "market.instrumentName") or get_field(row, "epic", "market.epic") or "?",
+        "epic": get_field(row, "epic", "market.epic", "position.epic", default=""),
+        "direction": str(get_field(row, "direction", "position.direction", default="")).upper(),
+        "size": float(get_field(row, "dealSize", "position.dealSize", "position.size", "size", default=0) or 0),
+        "open_level": float(get_field(row, "openLevel", "position.openLevel", "position.level", "level", default=0) or 0),
+        "bid": float(get_field(row, "bid", "market.bid", default=0) or 0),
+        "offer": float(get_field(row, "offer", "market.offer", default=0) or 0),
+        "stop_level": get_field(row, "stopLevel", "position.stopLevel"),
+        "limit_level": get_field(row, "limitLevel", "position.limitLevel"),
+        "currency": get_field(row, "currency", "position.currency", default="") or "",
+        "expiry": get_field(row, "expiry", "market.expiry", "position.expiry", default="-") or "-",
+    }
+
+
 def format_positions_df(df) -> Tuple[str, float, int, str]:
     if df is None or df.empty:
         return ("_no open positions_", 0.0, 0, "")
@@ -517,15 +575,16 @@ def format_positions_df(df) -> Tuple[str, float, int, str]:
     currency = ""
 
     for _, row in df.iterrows():
-        name = row.get("instrumentName") or row.get("epic", "?")
-        direction = str(row.get("direction", "")).upper()
-        size = float(row.get("dealSize", 0) or 0)
-        open_lvl = float(row.get("openLevel", 0) or 0)
-        bid = float(row.get("bid", 0) or 0)
-        offer = float(row.get("offer", 0) or 0)
-        stop = row.get("stopLevel")
-        limit = row.get("limitLevel")
-        currency = row.get("currency") or currency
+        f = extract_position_fields(row)
+        name = f["instrument_name"]
+        direction = f["direction"]
+        size = f["size"]
+        open_lvl = f["open_level"]
+        bid = f["bid"]
+        offer = f["offer"]
+        stop = f["stop_level"]
+        limit_lvl = f["limit_level"]
+        currency = f["currency"] or currency
 
         cur_price = bid if direction == "BUY" else offer
         if direction == "BUY":
@@ -543,8 +602,8 @@ def format_positions_df(df) -> Tuple[str, float, int, str]:
         extras = []
         if stop is not None:
             extras.append(f"SL: `{stop}`")
-        if limit is not None:
-            extras.append(f"TP: `{limit}`")
+        if limit_lvl is not None:
+            extras.append(f"TP: `{limit_lvl}`")
         if extras:
             block += "\n   " + "   ".join(extras)
         blocks.append(block)
@@ -986,13 +1045,16 @@ def close_position(login: IGLogin, position_row) -> Tuple[bool, str]:
     Close a single open position using the IG REST close-otc endpoint.
     Returns (success, message). 'position_row' is one row from fetch_open_positions().
     """
-    deal_id = position_row.get("dealId")
-    direction = str(position_row.get("direction", "")).upper()
-    size = float(position_row.get("dealSize", 0) or 0)
-    name = position_row.get("instrumentName") or position_row.get("epic", "?")
+    f = extract_position_fields(position_row)
+    deal_id = f["deal_id"]
+    direction = f["direction"]
+    size = f["size"]
+    name = f["instrument_name"]
 
     if not deal_id:
         return False, f"*{name}*: ❌ missing dealId"
+    if size <= 0:
+        return False, f"*{name}*: ❌ size is 0 (could not read from IG response)"
 
     opposite = "SELL" if direction == "BUY" else "BUY"
 
@@ -1132,14 +1194,15 @@ def build_close_account_page(login: IGLogin, account_id: str) -> Tuple[str, Inli
     rows = []
     body_lines = []
     for _, row in df.iterrows():
-        deal_id = row.get("dealId", "?")
-        inst = row.get("instrumentName") or row.get("epic", "?")
-        direction = str(row.get("direction", "")).upper()
-        size = float(row.get("dealSize", 0) or 0)
-        bid = float(row.get("bid", 0) or 0)
-        offer = float(row.get("offer", 0) or 0)
-        open_lvl = float(row.get("openLevel", 0) or 0)
-        currency = row.get("currency", "")
+        f = extract_position_fields(row)
+        deal_id = f["deal_id"] or "?"
+        inst = f["instrument_name"]
+        direction = f["direction"]
+        size = f["size"]
+        bid = f["bid"]
+        offer = f["offer"]
+        open_lvl = f["open_level"]
+        currency = f["currency"]
         cur_price = bid if direction == "BUY" else offer
         pnl = (cur_price - open_lvl) * size if direction == "BUY" else (open_lvl - cur_price) * size
         pnl_emoji = "🟢" if pnl >= 0 else "🔴"
@@ -1149,7 +1212,6 @@ def build_close_account_page(login: IGLogin, account_id: str) -> Tuple[str, Inli
             f"{dir_emoji} *{inst}*  `{direction} {size:g}`\n"
             f"   {pnl_emoji} `{fmt_money(pnl, currency)}`  •  `{deal_id}`"
         )
-        # The close button — use dealId in the callback
         rows.append([
             InlineKeyboardButton(
                 f"❌ Close: {inst[:25]}",
@@ -1463,17 +1525,18 @@ def build_copy_position_picker(
     # Build position list
     positions = []
     for _, row in df.iterrows():
+        f = extract_position_fields(row)
         positions.append({
-            "dealId": row.get("dealId"),
-            "instrumentName": row.get("instrumentName") or row.get("epic", "?"),
-            "epic": row.get("epic", ""),
-            "direction": str(row.get("direction", "")).upper(),
-            "size": float(row.get("dealSize", 0) or 0),
-            "stop": row.get("stopLevel"),
-            "limit": row.get("limitLevel"),
-            "expiry": row.get("expiry", "-"),
-            "currency": row.get("currency", "GBP"),
-            "openLevel": float(row.get("openLevel", 0) or 0),
+            "dealId": f["deal_id"],
+            "instrumentName": f["instrument_name"],
+            "epic": f["epic"],
+            "direction": f["direction"],
+            "size": f["size"],
+            "stop": f["stop_level"],
+            "limit": f["limit_level"],
+            "expiry": f["expiry"],
+            "currency": f["currency"] or "GBP",
+            "openLevel": f["open_level"],
         })
     session["positions"] = positions
     selected = session.setdefault("selected_deal_ids", set())
@@ -2078,13 +2141,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     main_menu_keyboard(chat.id),
                 )
                 return
-            inst = row.get("instrumentName") or row.get("epic", "?")
-            direction = str(row.get("direction", "")).upper()
-            size = float(row.get("dealSize", 0) or 0)
-            currency = row.get("currency", "")
-            bid = float(row.get("bid", 0) or 0)
-            offer = float(row.get("offer", 0) or 0)
-            open_lvl = float(row.get("openLevel", 0) or 0)
+            f = extract_position_fields(row)
+            inst = f["instrument_name"]
+            direction = f["direction"]
+            size = f["size"]
+            currency = f["currency"]
+            bid = f["bid"]
+            offer = f["offer"]
+            open_lvl = f["open_level"]
             cur_price = bid if direction == "BUY" else offer
             pnl = (cur_price - open_lvl) * size if direction == "BUY" else (open_lvl - cur_price) * size
             pnl_emoji = "🟢" if pnl >= 0 else "🔴"
