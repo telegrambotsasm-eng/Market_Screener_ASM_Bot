@@ -888,6 +888,96 @@ def build_accounts_list(chat_id: int) -> str:
 #   4. Bot shows result (closed N, failed M, with details)
 
 
+# Map IG's reason codes to human-readable messages.
+# Reference: IG documentation lists ~50 reason codes. These are the common ones.
+IG_REASON_MESSAGES = {
+    "MARKET_CLOSED": "🕐 Market is closed",
+    "MARKET_CLOSED_WITH_EDITS": "🕐 Market closed (no edits allowed)",
+    "MARKET_OFFLINE": "📴 Market is offline",
+    "MARKET_NOT_BORROWABLE": "🚫 Market not available for shorting",
+    "INSUFFICIENT_FUNDS": "💸 Insufficient funds",
+    "MANUAL_ORDER_TIMEOUT": "⏱ Manual order timed out (dealer review)",
+    "POSITION_NOT_AVAILABLE_TO_CLOSE": "❓ Position not available to close (already closed?)",
+    "POSITION_ALREADY_EXISTS_IN_OPPOSITE_DIRECTION": "🔁 Conflicting opposite position exists",
+    "OPPOSING_POSITIONS_NOT_ALLOWED": "🔁 Opposing positions not allowed",
+    "ATTACHED_ORDER_LEVEL_ERROR": "⚠️ Stop/limit level error",
+    "ATTACHED_ORDER_TRAILING_STOP_ERROR": "⚠️ Trailing stop error",
+    "CR_SPACING": "📏 Minimum spacing violation (stop/limit too close)",
+    "MARKET_PHASE_INVALID": "⏳ Market in invalid phase (e.g. auction)",
+    "MAX_AUTO_SIZE_EXCEEDED": "📊 Size too large for auto-execution",
+    "EXCHANGE_MANUAL_OVERRIDE": "👤 Exchange manual override",
+    "FINANCE_REPEAT_DEALING": "🚫 Finance: repeat dealing not allowed",
+    "ACCOUNT_NOT_ENABLED_TO_TRADING": "🔒 Account not enabled for trading",
+    "INVALID_ACCOUNT": "🔒 Invalid account",
+    "INVALID_BLOCK_DEAL_SIZE": "📏 Invalid deal size",
+    "INSTRUMENT_NOT_FOUND": "❓ Instrument not found",
+    "ACCOUNT_RISK_INSUFFICIENT_MARGIN_FOR_NEW_POSITION": "💸 Insufficient margin",
+    "STOP_OR_LIMIT_NOT_ALLOWED": "🚫 Stop/limit not allowed",
+    "STRIKE_LEVEL_TOLERANCE": "📏 Price tolerance exceeded",
+    "REJECT_SPREADBET_ORDER_ON_CFD_ACCOUNT": "🚫 Spread bet order on CFD account",
+    "REJECT_CFD_ORDER_ON_SPREADBET_ACCOUNT": "🚫 CFD order on spread bet account",
+}
+
+
+def explain_ig_reason(reason: str) -> str:
+    """Translate an IG reason code into a human-readable message."""
+    if not reason:
+        return ""
+    code = reason.strip().upper()
+    if code in IG_REASON_MESSAGES:
+        return IG_REASON_MESSAGES[code]
+    # Unknown code — show it as-is but make it readable
+    pretty = code.replace("_", " ").lower().capitalize()
+    return f"❓ {pretty} (`{code}`)"
+
+
+def extract_close_result(result: Any) -> Tuple[bool, str, str]:
+    """
+    Parse the response from trading-ig's close_open_position.
+    Returns (success, status_code, reason_code).
+    The library sometimes returns a dict, sometimes a DataFrame, sometimes a string.
+    """
+    if result is None:
+        return False, "NO_RESPONSE", ""
+
+    # Handle pandas Series/DataFrame
+    try:
+        import pandas as pd
+        if isinstance(result, pd.DataFrame):
+            if result.empty:
+                return False, "EMPTY_RESPONSE", ""
+            result = result.iloc[0].to_dict()
+        elif isinstance(result, pd.Series):
+            result = result.to_dict()
+    except ImportError:
+        pass
+
+    if isinstance(result, dict):
+        # Possible keys: dealStatus, status, reason, errorCode, dealReference
+        status = (
+            result.get("dealStatus")
+            or result.get("status")
+            or ""
+        )
+        reason = result.get("reason") or result.get("errorCode") or ""
+
+        # Some responses nest under affectedDeals or have a different shape
+        if not status and "affectedDeals" in result:
+            ad = result["affectedDeals"]
+            if isinstance(ad, list) and ad:
+                status = ad[0].get("status", "") or status
+
+        status = str(status).upper().strip()
+        reason = str(reason).upper().strip()
+
+        success = status in ("ACCEPTED", "OK", "SUCCESS")
+        # Sometimes dealStatus is REJECTED but no reason — keep blank reason
+        return success, status, reason
+
+    # String or other type — log it and treat as success only if we can't tell
+    return True, "UNKNOWN", str(result)[:100]
+
+
 def close_position(login: IGLogin, position_row) -> Tuple[bool, str]:
     """
     Close a single open position using the IG REST close-otc endpoint.
@@ -899,9 +989,8 @@ def close_position(login: IGLogin, position_row) -> Tuple[bool, str]:
     name = position_row.get("instrumentName") or position_row.get("epic", "?")
 
     if not deal_id:
-        return False, f"{name}: missing dealId"
+        return False, f"*{name}*: ❌ missing dealId"
 
-    # To close, send the OPPOSITE direction at MARKET for the same size
     opposite = "SELL" if direction == "BUY" else "BUY"
 
     try:
@@ -916,17 +1005,37 @@ def close_position(login: IGLogin, position_row) -> Tuple[bool, str]:
             quote_id=None,
             size=size,
         )
-        # trading-ig usually returns a confirmation dict
-        if isinstance(result, dict):
-            status = result.get("dealStatus") or result.get("status") or "OK"
-            reason = result.get("reason", "")
-            if status in ("ACCEPTED", "OK"):
-                return True, f"{name}: closed"
-            return False, f"{name}: {status} {reason}".strip()
-        return True, f"{name}: closed"
     except Exception as e:
-        logger.exception("close_position failed for %s", name)
-        return False, f"{name}: {e}"
+        # Network / library error
+        err_text = str(e)
+        logger.exception("close_position EXCEPTION for %s: %s", name, err_text)
+        # Try to extract the reason from the exception message (IG sometimes embeds it)
+        reason_msg = ""
+        for code in IG_REASON_MESSAGES:
+            if code in err_text.upper():
+                reason_msg = explain_ig_reason(code)
+                break
+        if reason_msg:
+            return False, f"*{name}*: {reason_msg}"
+        # Strip noisy parts of common error messages
+        short = err_text.split("\n")[0][:160]
+        return False, f"*{name}*: ❌ `{short}`"
+
+    success, status, reason = extract_close_result(result)
+    logger.info(
+        "close_position result for %s: success=%s status=%s reason=%s raw=%r",
+        name, success, status, reason, result,
+    )
+
+    if success:
+        return True, f"*{name}*: ✅ closed"
+
+    # Failed — give the best explanation we can
+    if reason:
+        return False, f"*{name}*: {explain_ig_reason(reason)}"
+    if status and status != "REJECTED":
+        return False, f"*{name}*: ❌ status `{status}`"
+    return False, f"*{name}*: ❌ rejected (no reason given by IG)"
 
 
 def close_all_in_account(login: IGLogin, account_id: str) -> Tuple[int, int, List[str]]:
