@@ -374,6 +374,7 @@ def main_menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
         ],
     ]
     if is_admin(chat_id):
+        rows.append([InlineKeyboardButton("📋 Copy positions", callback_data="pick:copy")])
         rows.append([InlineKeyboardButton("🔴 Close positions", callback_data="pick:close")])
         rows.append([InlineKeyboardButton("👥 Manage members", callback_data="members")])
     rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="menu")])
@@ -429,10 +430,12 @@ def account_picker_keyboard(action: str, login_idx: int, accounts_df) -> InlineK
                 [InlineKeyboardButton(label, callback_data=f"run:{action}:{login_idx}:{acc_id}")]
             )
     if action == "close":
-        # All accounts in login → confirm
         rows.append(
             [InlineKeyboardButton("⚠️ Close all in this login", callback_data=f"confirm:close_login:{login_idx}")]
         )
+    elif action == "copy":
+        # Copy needs a specific source account — no "all" option
+        pass
     else:
         rows.append(
             [InlineKeyboardButton("🌐 All accounts in this login", callback_data=f"run:{action}:{login_idx}:ALL")]
@@ -1187,6 +1190,479 @@ def confirmation_keyboard(yes_callback: str, no_callback: str = "menu") -> Inlin
 
 
 # ============================================================
+# COPY POSITIONS
+# ============================================================
+# Flow:
+#   1. Admin taps "📋 Copy positions" in main menu
+#   2. Login picker → Account picker (this is the SOURCE / master account)
+#   3. Bot lists open positions in that source account with checkboxes
+#   4. Admin selects which positions to copy and confirms selection
+#   5. Bot asks: target account type? (Spread bet / CFD / Both)
+#   6. Bot computes the matching target accounts (same type, GBP currency,
+#      excluding the source itself) across all logins
+#   7. Confirmation screen showing exactly what will happen on each target
+#   8. Admin confirms → bot copies one position at a time, gathering results
+#   9. Bot shows result report
+
+# Per-chat copy session state (keyed by chat_id). Cleared when admin cancels or finishes.
+# Each session: {
+#   "source_login_idx": int,
+#   "source_account_id": str,
+#   "source_currency": str,
+#   "source_balance": float,
+#   "source_account_type": str,  # "SPREADBET" or "CFD"
+#   "positions": [ {dealId, instrumentName, epic, direction, size, stop, limit, expiry, currency}, ... ],
+#   "selected_deal_ids": set,
+#   "target_type": str | None,  # "SPREADBET" / "CFD" / "BOTH" once chosen
+# }
+COPY_SESSIONS: Dict[int, Dict[str, Any]] = {}
+
+
+def normalize_account_type(raw: str) -> str:
+    """IG returns 'SPREADBET' or 'CFD' (or 'PHYSICAL' for shares). Normalize."""
+    if not raw:
+        return ""
+    s = str(raw).upper().replace(" ", "").replace("-", "").replace("_", "")
+    if "SPREAD" in s:
+        return "SPREADBET"
+    if "CFD" in s:
+        return "CFD"
+    return s
+
+
+def compute_copy_size(source_size: float, source_balance: float, target_balance: float) -> float:
+    """
+    Scale the size proportionally to balance.
+    copy_size = source_size * (target_balance / source_balance)
+    Caller is responsible for rounding to instrument minDealSize / step.
+    """
+    if source_balance <= 0:
+        raise ValueError("Source balance must be positive")
+    return source_size * (target_balance / source_balance)
+
+
+def round_size_to_step(size: float, step: float, min_size: float) -> Tuple[float, bool]:
+    """
+    Round size DOWN to the nearest valid step. Returns (rounded, valid).
+    valid=False if the rounded size is below the instrument minimum.
+    """
+    if step <= 0:
+        step = 0.5  # safe default
+    # Round down to nearest multiple of step
+    rounded = (int(size / step)) * step
+    # Avoid floating point noise: round to a sensible precision
+    decimals = max(0, -int(math.floor(math.log10(step))) if step < 1 else 0)
+    rounded = round(rounded, decimals + 2)
+    return rounded, (rounded >= min_size and rounded > 0)
+
+
+# import math lazily inside this section
+import math
+
+
+def get_instrument_constraints(login: IGLogin, epic: str) -> Tuple[float, float]:
+    """
+    Return (min_deal_size, deal_step) for an instrument.
+    Falls back to (0.5, 0.5) if the API call fails.
+    """
+    try:
+        details = login.call("fetch_market_by_epic", epic)
+        # The shape can be a dict with 'dealingRules' nested
+        if isinstance(details, dict):
+            rules = details.get("dealingRules") or {}
+            min_size_obj = rules.get("minDealSize") or {}
+            min_size = float(min_size_obj.get("value", 0.5) or 0.5)
+            # Step is not always present; use 'minStepDistance' or default
+            step_obj = rules.get("minStepDistance") or {}
+            step = float(step_obj.get("value", 0) or 0)
+            if step <= 0:
+                # Common fallback: step often equals min size
+                step = min_size
+            return min_size, step
+    except Exception as e:
+        logger.warning("Could not fetch instrument constraints for %s: %s", epic, e)
+    return 0.5, 0.5
+
+
+def fetch_target_accounts(
+    source_login_idx: int,
+    source_account_id: str,
+    target_type: str,  # "SPREADBET", "CFD", or "BOTH"
+    chat_id: int,
+) -> List[Dict[str, Any]]:
+    """
+    Find all eligible target accounts across the admin's allowed logins.
+    Returns a list of dicts: {login_idx, login, account_id, account_name, balance, currency, type}.
+    Excludes the source account itself. Filters by account type and GBP currency.
+    """
+    targets = []
+    for idx, login in registry.enumerate_for(chat_id):
+        try:
+            accounts = login.call("fetch_accounts")
+        except Exception as e:
+            logger.warning("fetch_accounts failed for %s: %s", login.label, e)
+            continue
+        if accounts is None or accounts.empty:
+            continue
+        for _, acc in accounts.iterrows():
+            acc_id = acc.get("accountId")
+            acc_type = normalize_account_type(acc.get("accountType", ""))
+            currency = acc.get("currency", "")
+            balance = float(acc.get("balance", 0) or 0)
+            # Skip source account
+            if idx == source_login_idx and acc_id == source_account_id:
+                continue
+            # Filter currency
+            if currency.upper() != "GBP":
+                continue
+            # Filter type
+            if target_type != "BOTH" and acc_type != target_type:
+                continue
+            targets.append({
+                "login_idx": idx,
+                "login": login,
+                "account_id": acc_id,
+                "account_name": acc.get("accountName", acc_id),
+                "balance": balance,
+                "currency": currency,
+                "type": acc_type,
+            })
+    return targets
+
+
+def open_position_copy(
+    target_login: IGLogin,
+    target_account_id: str,
+    source_pos: Dict[str, Any],
+    target_size: float,
+) -> Tuple[bool, str]:
+    """
+    Open a copy of source_pos on the target account with the computed size.
+    Returns (success, message).
+    """
+    epic = source_pos["epic"]
+    direction = source_pos["direction"]
+    expiry = source_pos.get("expiry") or "-"
+    currency = source_pos.get("currency") or "GBP"
+    inst_name = source_pos.get("instrumentName", epic)
+
+    try:
+        target_login.call("switch_account", target_account_id, False)
+    except Exception as e:
+        return False, f"*{inst_name}*: ❌ switch account failed: `{e}`"
+
+    try:
+        result = target_login.call(
+            "create_open_position",
+            currency_code=currency,
+            direction=direction,
+            epic=epic,
+            expiry=expiry,
+            force_open=True,
+            guaranteed_stop=False,
+            level=None,
+            limit_distance=None,
+            limit_level=None,
+            order_type="MARKET",
+            quote_id=None,
+            size=target_size,
+            stop_distance=None,
+            stop_level=None,
+            trailing_stop=False,
+            trailing_stop_increment=None,
+        )
+    except Exception as e:
+        err_text = str(e)
+        logger.exception("create_open_position EXCEPTION for %s on %s: %s", inst_name, target_account_id, err_text)
+        # Try to recognise IG reason codes embedded in exception message
+        reason_msg = ""
+        for code in IG_REASON_MESSAGES:
+            if code in err_text.upper():
+                reason_msg = explain_ig_reason(code)
+                break
+        if reason_msg:
+            return False, f"*{inst_name}*: {reason_msg}"
+        short = err_text.split("\n")[0][:160]
+        return False, f"*{inst_name}*: ❌ `{short}`"
+
+    success, status, reason = extract_close_result(result)  # same parser works
+    logger.info(
+        "create_open_position result %s on %s: success=%s status=%s reason=%s raw=%r",
+        inst_name, target_account_id, success, status, reason, result,
+    )
+
+    if success:
+        return True, f"*{inst_name}*: ✅ opened size `{target_size:g}`"
+    if reason:
+        return False, f"*{inst_name}*: {explain_ig_reason(reason)}"
+    if status and status != "REJECTED":
+        return False, f"*{inst_name}*: ❌ status `{status}`"
+    return False, f"*{inst_name}*: ❌ rejected (no reason given)"
+
+
+# ---------- Copy UI: page builders ----------
+def get_copy_session(chat_id: int) -> Dict[str, Any]:
+    return COPY_SESSIONS.setdefault(chat_id, {})
+
+
+def reset_copy_session(chat_id: int) -> None:
+    COPY_SESSIONS.pop(chat_id, None)
+
+
+def build_copy_position_picker(
+    login: IGLogin, account_id: str, chat_id: int
+) -> Tuple[str, InlineKeyboardMarkup]:
+    """List source-account positions with toggle checkboxes."""
+    login.call("switch_account", account_id, False)
+    df = login.call("fetch_open_positions")
+
+    accounts = login.call("fetch_accounts")
+    src_balance = 0.0
+    src_type = ""
+    src_currency = ""
+    src_name = account_id
+    if accounts is not None and not accounts.empty:
+        m = accounts[accounts["accountId"] == account_id]
+        if not m.empty:
+            acc = m.iloc[0]
+            src_balance = float(acc.get("balance", 0) or 0)
+            src_type = normalize_account_type(acc.get("accountType", ""))
+            src_currency = acc.get("currency", "")
+            src_name = acc_label(acc, short=True)
+
+    # Save session info
+    session = get_copy_session(chat_id)
+    session["source_account_id"] = account_id
+    session["source_balance"] = src_balance
+    session["source_account_type"] = src_type
+    session["source_currency"] = src_currency
+
+    if df is None or df.empty:
+        text = (
+            f"📋 *Copy positions*\n"
+            f"🔐 _Login:_ {login.label}\n"
+            f"🏦 _Source:_ {src_name}\n\n"
+            "📭 _No open positions to copy._"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back", callback_data="pick:copy")],
+        ])
+        return text, kb
+
+    # Validate source currency — must be GBP for this flow
+    if src_currency.upper() != "GBP":
+        text = (
+            f"⚠️ *Cannot copy*\n\n"
+            f"Source account currency is `{src_currency}`, but this bot only "
+            f"supports GBP source accounts for copy.\n\n"
+            "_All your accounts should be set to GBP._"
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="pick:copy")]])
+        return text, kb
+
+    # Build position list
+    positions = []
+    for _, row in df.iterrows():
+        positions.append({
+            "dealId": row.get("dealId"),
+            "instrumentName": row.get("instrumentName") or row.get("epic", "?"),
+            "epic": row.get("epic", ""),
+            "direction": str(row.get("direction", "")).upper(),
+            "size": float(row.get("dealSize", 0) or 0),
+            "stop": row.get("stopLevel"),
+            "limit": row.get("limitLevel"),
+            "expiry": row.get("expiry", "-"),
+            "currency": row.get("currency", "GBP"),
+            "openLevel": float(row.get("openLevel", 0) or 0),
+        })
+    session["positions"] = positions
+    selected = session.setdefault("selected_deal_ids", set())
+
+    text = (
+        f"📋 *Copy positions*\n"
+        f"🔐 _Login:_ {login.label}\n"
+        f"🏦 _Source:_ {src_name}\n"
+        f"_Balance:_ `{fmt_money(src_balance, src_currency)}`\n"
+        f"_Type:_ `{src_type or 'unknown'}`\n\n"
+        "_Tap positions to select them, then tap Next._"
+    )
+
+    rows = []
+    for p in positions:
+        deal_id = p["dealId"]
+        mark = "☑️" if deal_id in selected else "⬜"
+        label = (
+            f"{mark} {direction_emoji(p['direction'])} {p['instrumentName'][:20]}  "
+            f"size {p['size']:g}"
+        )
+        rows.append([InlineKeyboardButton(label, callback_data=f"copy_toggle:{deal_id}")])
+
+    # Select all / none
+    rows.append([
+        InlineKeyboardButton("☑️ Select all", callback_data="copy_selectall"),
+        InlineKeyboardButton("⬜ Clear", callback_data="copy_clearall"),
+    ])
+    rows.append([InlineKeyboardButton("▶️ Next (pick targets)", callback_data="copy_next")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"pickacc:copy:{session.get('source_login_idx', '?')}")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def build_copy_target_type_picker(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    session = get_copy_session(chat_id)
+    selected = session.get("selected_deal_ids", set())
+    src_type = session.get("source_account_type", "")
+    positions = session.get("positions", [])
+
+    selected_positions = [p for p in positions if p["dealId"] in selected]
+    text_parts = [
+        "📋 *Copy positions — choose target type*\n",
+        f"_{len(selected_positions)} position(s) selected_",
+    ]
+    for p in selected_positions[:8]:
+        text_parts.append(
+            f"   {direction_emoji(p['direction'])} *{p['instrumentName']}*  size `{p['size']:g}`"
+        )
+    if len(selected_positions) > 8:
+        text_parts.append(f"   _...and {len(selected_positions) - 8} more_")
+    text_parts.append("")
+    text_parts.append(f"_Source account type:_ `{src_type or 'unknown'}`")
+    text_parts.append("")
+    text_parts.append("_Which target account types should receive these copies?_")
+
+    rows = [
+        [InlineKeyboardButton("🇬🇧 Spread bet only", callback_data="copy_type:SPREADBET")],
+        [InlineKeyboardButton("📑 CFD only", callback_data="copy_type:CFD")],
+        [InlineKeyboardButton("🌐 Both types", callback_data="copy_type:BOTH")],
+        [InlineKeyboardButton("🔙 Back", callback_data="copy_back_picker")],
+    ]
+    return "\n".join(text_parts), InlineKeyboardMarkup(rows)
+
+
+def build_copy_confirmation(chat_id: int) -> Tuple[str, InlineKeyboardMarkup, List[Dict[str, Any]]]:
+    """
+    Build the final confirmation screen showing exactly what will happen on each target.
+    Also returns the resolved plan list (for execution).
+    Plan item: {target_login_idx, target_account_id, source_pos, computed_size, valid, reason}
+    """
+    session = get_copy_session(chat_id)
+    selected_ids = session.get("selected_deal_ids", set())
+    positions = session.get("positions", [])
+    selected_positions = [p for p in positions if p["dealId"] in selected_ids]
+    src_balance = session.get("source_balance", 0.0)
+    src_login_idx = session.get("source_login_idx")
+    src_account_id = session.get("source_account_id")
+    target_type = session.get("target_type", "BOTH")
+
+    targets = fetch_target_accounts(src_login_idx, src_account_id, target_type, chat_id)
+
+    if not targets:
+        text = (
+            "❌ *No eligible target accounts found*\n\n"
+            f"_Target type:_ `{target_type}`\n"
+            "_Looking for GBP accounts matching this type across all logins (excluding source)._"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Pick different type", callback_data="copy_next")],
+            [InlineKeyboardButton("🔙 Back to menu", callback_data="menu")],
+        ])
+        return text, kb, []
+
+    if not selected_positions:
+        text = "❌ _No positions selected._"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back", callback_data="copy_back_picker")],
+        ])
+        return text, kb, []
+
+    # Build the execution plan
+    plan = []
+    lines = ["⚠️ *Confirm copy*\n"]
+    lines.append(f"_Source balance:_ `{fmt_money(src_balance, 'GBP')}`")
+    lines.append("")
+
+    for t in targets:
+        login = t["login"]
+        lines.append(f"━━━━━━━━━━")
+        lines.append(
+            f"🎯 *{login.label}* — {t['account_name']}  ({t['type']})\n"
+            f"   _Balance:_ `{fmt_money(t['balance'], 'GBP')}`"
+        )
+
+        for p in selected_positions:
+            try:
+                raw_size = compute_copy_size(p["size"], src_balance, t["balance"])
+            except Exception as e:
+                lines.append(f"   ❌ *{p['instrumentName']}*: {e}")
+                plan.append({
+                    "target": t, "source_pos": p, "size": 0.0,
+                    "valid": False, "reason": str(e),
+                })
+                continue
+
+            # Look up instrument constraints on the target login
+            min_size, step = get_instrument_constraints(login, p["epic"])
+            rounded, valid = round_size_to_step(raw_size, step, min_size)
+
+            if not valid:
+                lines.append(
+                    f"   ⚠️ *{p['instrumentName']}*: size `{raw_size:.4f}` → `{rounded:g}` (below min `{min_size:g}`)"
+                )
+                plan.append({
+                    "target": t, "source_pos": p, "size": rounded,
+                    "valid": False, "reason": f"size {rounded:g} below min {min_size:g}",
+                })
+            else:
+                lines.append(
+                    f"   {direction_emoji(p['direction'])} *{p['instrumentName']}*: {p['direction']} `{rounded:g}` "
+                    f"_(from `{p['size']:g}` × {(t['balance']/src_balance):.3f})_"
+                )
+                plan.append({
+                    "target": t, "source_pos": p, "size": rounded,
+                    "valid": True, "reason": "",
+                })
+
+    n_valid = sum(1 for x in plan if x["valid"])
+    n_skip = len(plan) - n_valid
+    lines.append("")
+    lines.append(f"━━━━━━━━━━")
+    lines.append(f"*{n_valid}* copies to open, *{n_skip}* will be skipped.")
+    lines.append("_This will open positions at MARKET on the target accounts._")
+
+    rows = [
+        [InlineKeyboardButton("✅ YES, copy now", callback_data="copy_do")],
+        [InlineKeyboardButton("🛑 NO, cancel", callback_data="menu")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(rows), plan
+
+
+def execute_copy_plan(plan: List[Dict[str, Any]]) -> Tuple[int, int, List[str]]:
+    """Execute every valid item in the plan. Returns (succeeded, failed, detail_lines)."""
+    succeeded = 0
+    failed = 0
+    details = []
+    current_login_label = None
+    for item in plan:
+        if not item["valid"]:
+            failed += 1
+            details.append(f"⏭ *{item['source_pos']['instrumentName']}* on {item['target']['account_name']}: skipped — {item['reason']}")
+            continue
+        t = item["target"]
+        if current_login_label != t["login"].label:
+            details.append(f"\n━━━━━━━━━━\n🔐 *{t['login'].label}*")
+            current_login_label = t["login"].label
+        details.append(f"🎯 _{t['account_name']}_")
+        ok, msg = open_position_copy(
+            t["login"], t["account_id"], item["source_pos"], item["size"]
+        )
+        details.append(f"   {msg}")
+        if ok:
+            succeeded += 1
+        else:
+            failed += 1
+    return succeeded, failed, details
+
+
+# ============================================================
 # BANNER MESSAGE HELPERS
 # ============================================================
 async def send_or_edit_banner(
@@ -1388,13 +1864,11 @@ async def run_action(
         elif action == "summary":
             text = build_summary(login_idx, account_id, chat.id)
         elif action == "close":
-            # Admin-only check
             if not is_admin(chat.id):
                 await query.answer("⛔ Admin only.", show_alert=True)
                 return
-            # account_id can only be a real id here (ALL is routed through confirm)
             if account_id == "ALL":
-                return  # safety: handled via confirm:close_login path
+                return
             login = registry.by_idx(login_idx)
             try:
                 text, kb = build_close_account_page(login, account_id)
@@ -1406,9 +1880,32 @@ async def run_action(
                     main_menu_keyboard(chat.id),
                 )
                 return
-            # Remember context for confirmation step
             context.user_data["close_login_idx"] = login_idx
             context.user_data["close_account_id"] = account_id
+            await send_or_edit_banner(update, context, "positions", text, kb)
+            return
+        elif action == "copy":
+            if not is_admin(chat.id):
+                await query.answer("⛔ Admin only.", show_alert=True)
+                return
+            if account_id == "ALL":
+                # Copy must have a specific source account
+                return
+            login = registry.by_idx(login_idx)
+            # Start a fresh copy session
+            reset_copy_session(chat.id)
+            session = get_copy_session(chat.id)
+            session["source_login_idx"] = login_idx
+            try:
+                text, kb = build_copy_position_picker(login, account_id, chat.id)
+            except Exception as e:
+                logger.exception("copy picker failed")
+                await send_or_edit_banner(
+                    update, context, "error",
+                    f"*Error*\n`{e}`",
+                    main_menu_keyboard(chat.id),
+                )
+                return
             await send_or_edit_banner(update, context, "positions", text, kb)
             return
         else:
@@ -1826,6 +2323,140 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 update, context, "main", text, main_menu_keyboard(chat.id)
             )
             return
+
+    # ===== COPY POSITIONS HANDLERS =====
+    if data.startswith("copy_toggle:") or data in ("copy_selectall", "copy_clearall", "copy_back_picker"):
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        session = get_copy_session(chat.id)
+        positions = session.get("positions", [])
+        selected = session.setdefault("selected_deal_ids", set())
+
+        if data.startswith("copy_toggle:"):
+            deal_id = data.split(":", 1)[1]
+            if deal_id in selected:
+                selected.discard(deal_id)
+            else:
+                selected.add(deal_id)
+        elif data == "copy_selectall":
+            for p in positions:
+                selected.add(p["dealId"])
+        elif data == "copy_clearall":
+            selected.clear()
+        elif data == "copy_back_picker":
+            # Same as re-displaying the picker
+            pass
+
+        # Re-render the picker
+        login_idx = session.get("source_login_idx")
+        account_id = session.get("source_account_id")
+        if login_idx is None or account_id is None:
+            await show_menu(update, context)
+            return
+        login = registry.by_idx(login_idx)
+        try:
+            text, kb = build_copy_position_picker(login, account_id, chat.id)
+        except Exception as e:
+            await send_or_edit_banner(
+                update, context, "error",
+                f"*Error*\n`{e}`", main_menu_keyboard(chat.id),
+            )
+            return
+        await send_or_edit_banner(update, context, "positions", text, kb)
+        return
+
+    if data == "copy_next":
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        session = get_copy_session(chat.id)
+        if not session.get("selected_deal_ids"):
+            await query.answer("Select at least one position first.", show_alert=True)
+            return
+        text, kb = build_copy_target_type_picker(chat.id)
+        await send_or_edit_banner(update, context, "positions", text, kb)
+        return
+
+    if data.startswith("copy_type:"):
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        target_type = data.split(":", 1)[1]
+        if target_type not in ("SPREADBET", "CFD", "BOTH"):
+            await query.answer("Invalid type.", show_alert=True)
+            return
+        session = get_copy_session(chat.id)
+        session["target_type"] = target_type
+        # Show working state while we fetch all the data
+        try:
+            await query.edit_message_caption(
+                caption="⏳ *Building copy plan...*", parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            try:
+                await query.edit_message_text(
+                    "⏳ *Building copy plan...*", parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception:
+                pass
+
+        try:
+            text, kb, plan = build_copy_confirmation(chat.id)
+        except Exception as e:
+            logger.exception("build_copy_confirmation failed")
+            await send_or_edit_banner(
+                update, context, "error",
+                f"*Error*\n`{e}`", main_menu_keyboard(chat.id),
+            )
+            return
+        # Save the plan for execution
+        session["plan"] = plan
+        await send_or_edit_banner(update, context, "error", text, kb)
+        return
+
+    if data == "copy_do":
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        session = get_copy_session(chat.id)
+        plan = session.get("plan", [])
+        if not plan:
+            await query.answer("No plan to execute.", show_alert=True)
+            await show_menu(update, context)
+            return
+
+        try:
+            await query.edit_message_caption(
+                caption="⏳ *Opening copies...*", parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            try:
+                await query.edit_message_text(
+                    "⏳ *Opening copies...*", parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception:
+                pass
+
+        try:
+            succeeded, failed, details = execute_copy_plan(plan)
+        except Exception as e:
+            logger.exception("execute_copy_plan crashed")
+            succeeded, failed, details = 0, 1, [f"❌ exception: {e}"]
+
+        logger.warning("Copy by admin: succeeded=%d failed=%d", succeeded, failed)
+        reset_copy_session(chat.id)
+
+        text = (
+            f"*📋 Copy result*\n\n"
+            f"✅ Opened: {succeeded}\n"
+            f"❌ Failed: {failed}\n"
+            + "\n".join(details)
+        )
+        await send_or_edit_banner(
+            update, context, "main", text, main_menu_keyboard(chat.id)
+        )
+        return
 
     await show_menu(update, context)
 
