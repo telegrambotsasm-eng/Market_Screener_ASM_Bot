@@ -204,12 +204,14 @@ class IGLogin:
         self._api_key: str = cfg["api_key"]
         self._acc_type: str = cfg["acc_type"]
         self._svc: Optional[IGService] = None
+        self._current_account: Optional[str] = None  # tracks which account is active
 
     def _login(self) -> None:
         logger.info("Logging in to IG '%s' (%s)...", self.label, self._acc_type)
         svc = IGService(self._username, self._password, self._api_key, self._acc_type)
         svc.create_session()
         self._svc = svc
+        self._current_account = None  # unknown until we switch or detect
         logger.info("IG login '%s' OK.", self.label)
 
     def get(self) -> IGService:
@@ -218,6 +220,33 @@ class IGLogin:
         return self._svc  # type: ignore
 
     def call(self, fn_name: str, *args, **kwargs):
+        # Special handling for switch_account: skip if we're already on it,
+        # because IG returns "accountId-must-be-different" if you switch to current.
+        if fn_name == "switch_account" and args:
+            target = args[0]
+            if self._current_account == target:
+                logger.debug("Skipping switch_account: already on '%s'", target)
+                return None
+            try:
+                result = getattr(self.get(), fn_name)(*args, **kwargs)
+                self._current_account = target
+                return result
+            except Exception as e:
+                msg = str(e).lower()
+                # Treat "must be different" as success — we're already there
+                if "must-be-different" in msg or "different" in msg:
+                    logger.debug("Already on account '%s' (IG said so)", target)
+                    self._current_account = target
+                    return None
+                if any(k in msg for k in ("unauthor", "token", "session", "401", "403")):
+                    logger.warning("Session '%s' dead (%s). Re-login.", self.label, e)
+                    self._svc = None
+                    self._current_account = None
+                    result = getattr(self.get(), fn_name)(*args, **kwargs)
+                    self._current_account = target
+                    return result
+                raise
+
         try:
             return getattr(self.get(), fn_name)(*args, **kwargs)
         except Exception as e:
@@ -225,6 +254,7 @@ class IGLogin:
             if any(k in msg for k in ("unauthor", "token", "session", "401", "403")):
                 logger.warning("Session '%s' dead (%s). Re-login.", self.label, e)
                 self._svc = None
+                self._current_account = None
                 return getattr(self.get(), fn_name)(*args, **kwargs)
             raise
 
