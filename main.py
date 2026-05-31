@@ -376,6 +376,7 @@ def main_menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     if is_admin(chat_id):
         rows.append([InlineKeyboardButton("📋 Copy positions", callback_data="pick:copy")])
         rows.append([InlineKeyboardButton("🔴 Close positions", callback_data="pick:close")])
+        rows.append([InlineKeyboardButton("🔍 Explore (oil options)", callback_data="explore_menu")])
         rows.append([InlineKeyboardButton("👥 Manage members", callback_data="members")])
     rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="menu")])
     return InlineKeyboardMarkup(rows)
@@ -1726,6 +1727,248 @@ def execute_copy_plan(plan: List[Dict[str, Any]]) -> Tuple[int, int, List[str]]:
 
 
 # ============================================================
+# EXPLORE (find oil + options structure on IG)
+# ============================================================
+# This is a one-time discovery toolset. We use it to figure out:
+#   - what the SPOT oil instrument is called and its current price
+#   - where the option chain lives in IG's navigation tree
+#   - what the strike spacing looks like
+#   - what the option price range looks like
+#
+# Once we know all this, we'll build the real monitoring loop based on
+# the actual epics returned by these explorers.
+
+
+def explore_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🔎 Step 1: Search 'oil' markets", callback_data="explore:search_oil")],
+        [InlineKeyboardButton("🌳 Step 2: Browse option nodes", callback_data="explore:nav_root")],
+        [InlineKeyboardButton("💰 Step 3: Sample option prices", callback_data="explore:sample_prices")],
+        [InlineKeyboardButton("🔙 Back to menu", callback_data="menu")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def explore_login_picker_keyboard(action: str) -> InlineKeyboardMarkup:
+    """Pick which login to use for the exploration call (admin only)."""
+    rows = []
+    for idx, login in registry.enumerate():
+        rows.append([InlineKeyboardButton(f"🔐 {login.label}", callback_data=f"explore_login:{action}:{idx}")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="explore_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+# Per-chat exploration state
+EXPLORE_STATE: Dict[int, Dict[str, Any]] = {}
+
+
+def get_explore_state(chat_id: int) -> Dict[str, Any]:
+    return EXPLORE_STATE.setdefault(chat_id, {})
+
+
+# ---------- Step 1: Search markets ----------
+def explore_search_oil(login: IGLogin) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Search IG for oil-related instruments. Returns (text_summary, raw_results).
+    Uses the search_markets endpoint of trading-ig.
+    """
+    queries = ["US Crude", "WTI", "Crude Oil", "oil"]
+    seen_epics = set()
+    matches: List[Dict[str, Any]] = []
+
+    for q in queries:
+        try:
+            df = login.call("search_markets", q)
+        except Exception as e:
+            logger.warning("search_markets('%s') failed: %s", q, e)
+            continue
+        if df is None or (hasattr(df, "empty") and df.empty):
+            continue
+        try:
+            rows = df.to_dict(orient="records") if hasattr(df, "to_dict") else list(df)
+        except Exception:
+            rows = []
+        for r in rows:
+            epic = r.get("epic") or r.get("market.epic")
+            if not epic or epic in seen_epics:
+                continue
+            seen_epics.add(epic)
+            matches.append({
+                "epic": epic,
+                "instrumentName": r.get("instrumentName") or r.get("market.instrumentName") or "?",
+                "expiry": r.get("expiry") or r.get("market.expiry") or "-",
+                "marketStatus": r.get("marketStatus") or r.get("market.marketStatus") or "-",
+                "instrumentType": r.get("instrumentType") or r.get("market.instrumentType") or "-",
+            })
+
+    # Sort: put options last (we want to identify spot + futures clearly), then alpha
+    def sort_key(m):
+        name = m["instrumentName"].lower()
+        is_option = any(k in name for k in (" call", " put", "option"))
+        return (is_option, name)
+    matches.sort(key=sort_key)
+
+    # Build summary text
+    lines = [
+        f"🔎 *Oil markets found:* {len(matches)}",
+        "_(showing first 40 — non-options first)_",
+        "",
+    ]
+    for m in matches[:40]:
+        lines.append(
+            f"• `{m['epic']}`\n"
+            f"   *{m['instrumentName']}*  ({m['instrumentType']}, expiry={m['expiry']}, status={m['marketStatus']})"
+        )
+    if len(matches) > 40:
+        lines.append(f"\n_... and {len(matches) - 40} more (not shown)_")
+
+    return "\n".join(lines), matches
+
+
+# ---------- Step 2: Browse navigation tree ----------
+# IG has a navigation hierarchy: /marketnavigation/{nodeId}/
+# The root has top-level categories like Indices, Commodities, etc.
+# We descend until we find option chains.
+def explore_navigation(login: IGLogin, node_id: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Call IG's market navigation endpoint. Returns (text, child_nodes, markets_at_this_node).
+    If node_id is None, fetches the root.
+    """
+    try:
+        if node_id is None:
+            data = login.call("fetch_top_level_navigation_nodes")
+        else:
+            data = login.call("fetch_sub_nodes_by_node", node_id)
+    except Exception as e:
+        return f"❌ navigation call failed: `{e}`", [], []
+
+    # The trading-ig library can return different shapes here.
+    # Typically: dict with 'nodes' and 'markets' lists, or two DataFrames.
+    nodes: List[Dict[str, Any]] = []
+    markets: List[Dict[str, Any]] = []
+
+    if isinstance(data, dict):
+        nodes_raw = data.get("nodes", []) or []
+        markets_raw = data.get("markets", []) or []
+        # Each can be a list of dicts or a DataFrame
+        try:
+            import pandas as pd
+            if hasattr(nodes_raw, "to_dict"):
+                nodes_raw = nodes_raw.to_dict(orient="records")
+            if hasattr(markets_raw, "to_dict"):
+                markets_raw = markets_raw.to_dict(orient="records")
+        except Exception:
+            pass
+        for n in nodes_raw:
+            nodes.append({"id": n.get("id"), "name": n.get("name")})
+        for mk in markets_raw:
+            markets.append({
+                "epic": mk.get("epic"),
+                "instrumentName": mk.get("instrumentName") or "?",
+                "expiry": mk.get("expiry", "-"),
+                "marketStatus": mk.get("marketStatus", "-"),
+                "instrumentType": mk.get("instrumentType", "-"),
+            })
+    elif isinstance(data, tuple) and len(data) == 2:
+        # Some versions return (nodes_df, markets_df)
+        nodes_df, markets_df = data
+        try:
+            if hasattr(nodes_df, "to_dict"):
+                for n in nodes_df.to_dict(orient="records"):
+                    nodes.append({"id": n.get("id"), "name": n.get("name")})
+            if hasattr(markets_df, "to_dict"):
+                for mk in markets_df.to_dict(orient="records"):
+                    markets.append({
+                        "epic": mk.get("epic"),
+                        "instrumentName": mk.get("instrumentName") or "?",
+                        "expiry": mk.get("expiry", "-"),
+                        "marketStatus": mk.get("marketStatus", "-"),
+                        "instrumentType": mk.get("instrumentType", "-"),
+                    })
+        except Exception as e:
+            logger.warning("could not parse navigation tuple: %s", e)
+
+    lines = []
+    if node_id is None:
+        lines.append("🌳 *Navigation root*")
+    else:
+        lines.append(f"🌳 *Node `{node_id}`*")
+    lines.append("")
+
+    if nodes:
+        lines.append(f"📁 *Sub-categories* ({len(nodes)}):")
+        for n in nodes[:30]:
+            lines.append(f"   `{n['id']}` — {n['name']}")
+        if len(nodes) > 30:
+            lines.append(f"   _...and {len(nodes) - 30} more_")
+        lines.append("")
+    if markets:
+        lines.append(f"📈 *Markets here* ({len(markets)}):")
+        for m in markets[:25]:
+            lines.append(
+                f"   • `{m['epic']}`  *{m['instrumentName']}*"
+            )
+        if len(markets) > 25:
+            lines.append(f"   _...and {len(markets) - 25} more_")
+    if not nodes and not markets:
+        lines.append("_(empty)_")
+
+    return "\n".join(lines), nodes, markets
+
+
+def navigation_keyboard(nodes: List[Dict[str, Any]], markets: List[Dict[str, Any]], parent_id: Optional[str] = None) -> InlineKeyboardMarkup:
+    """Buttons to descend into sub-nodes."""
+    rows = []
+    # Highlight nodes whose name contains 'option' or 'oil' or 'crude'
+    def priority(n):
+        nm = (n["name"] or "").lower()
+        # smaller = higher priority
+        if any(k in nm for k in ("option", "weekly", "daily")):
+            return 0
+        if any(k in nm for k in ("oil", "crude", "wti", "energy", "commodit")):
+            return 1
+        return 2
+    sorted_nodes = sorted(nodes, key=priority)
+    for n in sorted_nodes[:15]:
+        label = (n["name"] or "?")[:35]
+        rows.append([InlineKeyboardButton(f"📁 {label}", callback_data=f"explore_nav:{n['id']}")])
+    rows.append([InlineKeyboardButton("🔙 Back to explore menu", callback_data="explore_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ---------- Step 3: Sample option prices ----------
+def explore_sample_prices(login: IGLogin, epics: List[str]) -> str:
+    """
+    Given a list of epics, fetch each one's current bid/offer and return a report.
+    Used to inspect option price structure once we've identified some epics.
+    """
+    if not epics:
+        return "_No epics to fetch (pass epics in chat or pick them via navigation)._"
+    lines = [f"💰 *Sample prices* ({len(epics)} markets)\n"]
+    for epic in epics[:30]:
+        try:
+            details = login.call("fetch_market_by_epic", epic)
+        except Exception as e:
+            lines.append(f"• `{epic}` — ❌ {e}")
+            continue
+        if not isinstance(details, dict):
+            lines.append(f"• `{epic}` — (unexpected response shape)")
+            continue
+        instrument = details.get("instrument") or {}
+        snapshot = details.get("snapshot") or {}
+        name = instrument.get("name", "?")
+        bid = snapshot.get("bid")
+        offer = snapshot.get("offer")
+        status = snapshot.get("marketStatus", "-")
+        update_time = snapshot.get("updateTime", "-")
+        lines.append(
+            f"• `{epic}`\n"
+            f"   *{name}*  bid=`{bid}` offer=`{offer}` ({status} {update_time})"
+        )
+    return "\n".join(lines)
+
+
+# ============================================================
 # BANNER MESSAGE HELPERS
 # ============================================================
 async def send_or_edit_banner(
@@ -2522,10 +2765,189 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # ===== EXPLORE HANDLERS (admin only — investigative tools) =====
+    if data == "explore_menu":
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        text = (
+            "🔍 *Explore — Oil options*\n\n"
+            "_Use these tools to find the structure of oil option markets "
+            "on your IG account. Pick steps in order._\n\n"
+            "• *Step 1*: search for any market with 'oil' or 'crude' in the name\n"
+            "• *Step 2*: browse the navigation tree to find option chains\n"
+            "• *Step 3*: sample option prices (you'll be asked for epics)"
+        )
+        await send_or_edit_banner(update, context, "accounts", text, explore_menu_keyboard())
+        return
+
+    if data == "explore:search_oil":
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        # Need to know which login to query
+        await send_or_edit_banner(
+            update, context, "picker_login",
+            "🔎 *Search oil markets*\n\nPick which login to query:",
+            explore_login_picker_keyboard("search_oil"),
+        )
+        return
+
+    if data == "explore:nav_root":
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        await send_or_edit_banner(
+            update, context, "picker_login",
+            "🌳 *Browse navigation*\n\nPick which login to query:",
+            explore_login_picker_keyboard("nav_root"),
+        )
+        return
+
+    if data == "explore:sample_prices":
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        # We need a list of epics. Ask the user to send them as a message.
+        state = get_explore_state(chat.id)
+        state["awaiting"] = "sample_epics"
+        text = (
+            "💰 *Sample prices*\n\n"
+            "Send a message with one EPIC per line, like:\n"
+            "```\n"
+            "CC.D.CL.USS.IP\n"
+            "OP.D.OILUS.7400P.IP\n"
+            "```\n\n"
+            "_(Get epics from the search or navigation steps above.)_\n\n"
+            "Then pick a login to query."
+        )
+        await send_or_edit_banner(
+            update, context, "picker_login", text,
+            explore_login_picker_keyboard("sample_prices"),
+        )
+        return
+
+    if data.startswith("explore_login:"):
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        _, action, login_idx_s = data.split(":", 2)
+        login_idx = int(login_idx_s)
+        login = registry.by_idx(login_idx)
+        state = get_explore_state(chat.id)
+        state["login_idx"] = login_idx
+
+        try:
+            await query.edit_message_caption(
+                caption="⏳ *Querying IG...*", parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            try:
+                await query.edit_message_text(
+                    "⏳ *Querying IG...*", parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception:
+                pass
+
+        if action == "search_oil":
+            try:
+                text, matches = explore_search_oil(login)
+            except Exception as e:
+                logger.exception("explore_search_oil failed")
+                text = f"❌ *Error*\n`{e}`"
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back to explore menu", callback_data="explore_menu")],
+            ])
+            await send_or_edit_banner(update, context, "accounts", text, kb)
+            return
+
+        if action == "nav_root":
+            try:
+                text, nodes, markets = explore_navigation(login, None)
+            except Exception as e:
+                logger.exception("explore_navigation root failed")
+                text = f"❌ *Error*\n`{e}`"
+                nodes, markets = [], []
+            kb = navigation_keyboard(nodes, markets, None)
+            await send_or_edit_banner(update, context, "accounts", text, kb)
+            return
+
+        if action == "sample_prices":
+            epics = state.get("sample_epics", [])
+            if not epics:
+                text = (
+                    "❌ *No epics provided.*\n\n"
+                    "Send a message with one EPIC per line first, then pick a login."
+                )
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back", callback_data="explore_menu")],
+                ])
+                await send_or_edit_banner(update, context, "accounts", text, kb)
+                return
+            try:
+                text = explore_sample_prices(login, epics)
+            except Exception as e:
+                logger.exception("explore_sample_prices failed")
+                text = f"❌ *Error*\n`{e}`"
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="explore_menu")],
+            ])
+            await send_or_edit_banner(update, context, "accounts", text, kb)
+            return
+
+    if data.startswith("explore_nav:"):
+        if not is_admin(chat.id):
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        node_id = data.split(":", 1)[1]
+        state = get_explore_state(chat.id)
+        login_idx = state.get("login_idx")
+        if login_idx is None:
+            await query.answer("Pick a login first.", show_alert=True)
+            return
+        login = registry.by_idx(login_idx)
+        try:
+            await query.edit_message_caption(
+                caption="⏳ *Descending tree...*", parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            pass
+        try:
+            text, nodes, markets = explore_navigation(login, node_id)
+        except Exception as e:
+            logger.exception("explore_navigation %s failed", node_id)
+            text = f"❌ *Error*\n`{e}`"
+            nodes, markets = [], []
+        kb = navigation_keyboard(nodes, markets, node_id)
+        await send_or_edit_banner(update, context, "accounts", text, kb)
+        return
+
     await show_menu(update, context)
 
 
 async def on_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    # Check if we're awaiting explore epics input
+    state = EXPLORE_STATE.get(chat.id, {})
+    if state.get("awaiting") == "sample_epics" and update.message and update.message.text:
+        # Parse epics from the message
+        lines = update.message.text.strip().splitlines()
+        epics = []
+        for ln in lines:
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            epics.append(ln)
+        if epics:
+            state["sample_epics"] = epics
+            state["awaiting"] = None
+            await update.message.reply_text(
+                f"✅ Got {len(epics)} epic(s). Now pick a login from the previous menu to fetch prices."
+            )
+            return
+    # Default fall-through: show menu
     await show_menu(update, context)
 
 
