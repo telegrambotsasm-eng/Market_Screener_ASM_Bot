@@ -357,7 +357,6 @@ def build_positions_all_in_login(login: IGLogin) -> str:
         return f"No accounts in '{login.label}'."
 
     sections = []
-    grand_totals: Dict[str, float] = {}
     grand_count = 0
 
     for _, acc in accounts.iterrows():
@@ -372,24 +371,21 @@ def build_positions_all_in_login(login: IGLogin) -> str:
 
         body, pnl, count, currency = format_positions_df(df)
         grand_count += count
-        if currency:
-            grand_totals[currency] = grand_totals.get(currency, 0.0) + pnl
 
         section = f"━━━━━━━━━━\n🏦 *{label}* — {count} pos"
         if count > 0:
             section += f"\n\n{body}"
             emoji = "🟢" if pnl >= 0 else "🔴"
-            section += f"\n\n{emoji} _Subtotal:_ `{fmt_money(pnl, currency)}`"
+            section += f"\n\n{emoji} _Account P&L:_ `{fmt_money(pnl, currency)}`"
         sections.append(section)
 
     header = f"📊 *{login.label}* — {grand_count} open position(s)\n"
-    return header + "\n\n".join(sections) + grand_totals_text(grand_totals, "Total P&L:")
+    return header + "\n\n".join(sections)
 
 
 def build_positions_all_logins() -> str:
-    """Compact view: per login, per account. Just counts and subtotals (no per-position detail)."""
+    """Compact view: per login, per account. Counts and per-account P&L only — no totals across accounts."""
     sections = []
-    grand_totals: Dict[str, float] = {}
     grand_count = 0
 
     for _, login in registry.enumerate():
@@ -405,7 +401,6 @@ def build_positions_all_logins() -> str:
 
         acc_lines = []
         login_count = 0
-        login_totals: Dict[str, float] = {}
 
         for _, acc in accounts.iterrows():
             acc_id = acc.get("accountId")
@@ -420,9 +415,6 @@ def build_positions_all_logins() -> str:
             _, pnl, count, currency = format_positions_df(df)
             login_count += count
             grand_count += count
-            if currency:
-                login_totals[currency] = login_totals.get(currency, 0.0) + pnl
-                grand_totals[currency] = grand_totals.get(currency, 0.0) + pnl
 
             if count > 0:
                 emoji = "🟢" if pnl >= 0 else "🔴"
@@ -432,23 +424,14 @@ def build_positions_all_logins() -> str:
             else:
                 acc_lines.append(f"   🏦 {alabel} — _no positions_")
 
-        # Login subtotal
-        subtotal_str = ""
-        if login_totals:
-            parts = []
-            for c, v in login_totals.items():
-                em = "🟢" if v >= 0 else "🔴"
-                parts.append(f"{em} `{fmt_money(v, c)}`")
-            subtotal_str = "  •  " + " / ".join(parts)
-
         section = (
-            f"═══════════════\n🔐 *{login.label}* — {login_count} pos{subtotal_str}\n"
+            f"═══════════════\n🔐 *{login.label}* — {login_count} pos\n"
             + "\n".join(acc_lines)
         )
         sections.append(section)
 
     header = f"📊 *All Logins* — {grand_count} open position(s) total\n"
-    return header + "\n\n".join(sections) + grand_totals_text(grand_totals, "Grand Total P&L:")
+    return header + "\n\n".join(sections)
 
 
 # ============================================================
@@ -496,29 +479,16 @@ def build_balance_all_in_login(login: IGLogin) -> str:
         return f"No accounts in '{login.label}'."
 
     sections = [format_balance_row(acc) for _, acc in accounts.iterrows()]
-    totals: Dict[str, Dict[str, float]] = {}
-    for _, acc in accounts.iterrows():
-        cur = acc.get("currency", "")
-        t = totals.setdefault(cur, {"balance": 0.0, "available": 0.0, "pnl": 0.0})
-        t["balance"] += float(acc.get("balance", 0) or 0)
-        t["available"] += float(acc.get("available", 0) or 0)
-        t["pnl"] += float(acc.get("profitLoss", 0) or 0)
-
-    total_lines = ["━━━━━━━━━━", f"*Totals — {login.label}*"]
-    for cur, t in totals.items():
-        emoji = "🟢" if t["pnl"] >= 0 else "🔴"
-        total_lines.append(
-            f"   Balance: `{fmt_money(t['balance'], cur)}`\n"
-            f"   Available: `{fmt_money(t['available'], cur)}`\n"
-            f"   {emoji} P&L: `{fmt_money(t['pnl'], cur)}`"
-        )
-
-    return f"💼 *{login.label}*\n\n" + "\n\n".join(sections) + "\n\n" + "\n".join(total_lines)
+    return (
+        f"💼 *{login.label}*\n_{len(accounts)} account(s)_\n\n"
+        + "\n\n".join(sections)
+    )
 
 
 def build_balance_all_logins() -> str:
+    """Show every account separately, no totals (CFD vs Spread Bet should never be summed)."""
     sections = []
-    grand: Dict[str, Dict[str, float]] = {}
+    total_accounts = 0
 
     for _, login in registry.enumerate():
         try:
@@ -530,41 +500,15 @@ def build_balance_all_logins() -> str:
             sections.append(f"═══════════════\n🔐 *{login.label}*\n_no accounts_")
             continue
 
-        # Per-login totals (compact)
-        per_login: Dict[str, Dict[str, float]] = {}
+        total_accounts += len(accounts)
+        parts = [f"═══════════════\n🔐 *{login.label}*"]
         for _, acc in accounts.iterrows():
-            cur = acc.get("currency", "")
-            t = per_login.setdefault(cur, {"balance": 0.0, "available": 0.0, "pnl": 0.0})
-            g = grand.setdefault(cur, {"balance": 0.0, "available": 0.0, "pnl": 0.0})
-            for k, key in (
-                ("balance", "balance"),
-                ("available", "available"),
-                ("pnl", "profitLoss"),
-            ):
-                val = float(acc.get(key, 0) or 0)
-                t[k] += val
-                g[k] += val
-
-        parts = [f"═══════════════\n🔐 *{login.label}* ({len(accounts)} acc)"]
-        for cur, t in per_login.items():
-            emoji = "🟢" if t["pnl"] >= 0 else "🔴"
-            parts.append(
-                f"   Balance: `{fmt_money(t['balance'], cur)}`\n"
-                f"   Available: `{fmt_money(t['available'], cur)}`\n"
-                f"   {emoji} P&L: `{fmt_money(t['pnl'], cur)}`"
-            )
+            parts.append("")
+            parts.append(format_balance_row(acc))
         sections.append("\n".join(parts))
 
-    grand_lines = ["━━━━━━━━━━", "*GRAND TOTALS (all logins)*"]
-    for cur, t in grand.items():
-        emoji = "🟢" if t["pnl"] >= 0 else "🔴"
-        grand_lines.append(
-            f"   Balance: `{fmt_money(t['balance'], cur)}`\n"
-            f"   Available: `{fmt_money(t['available'], cur)}`\n"
-            f"   {emoji} P&L: `{fmt_money(t['pnl'], cur)}`"
-        )
-
-    return "💼 *All Logins — Balance*\n\n" + "\n\n".join(sections) + "\n\n" + "\n".join(grand_lines)
+    header = f"💼 *All Logins — Balance*\n_{len(registry.logins)} login(s), {total_accounts} account(s)_\n"
+    return header + "\n\n".join(sections)
 
 
 # ============================================================
@@ -613,9 +557,7 @@ def build_summary_all_in_login(login: IGLogin) -> str:
     if accounts is None or accounts.empty:
         return f"No accounts in '{login.label}'."
 
-    lines = [f"📈 *Summary — {login.label}*"]
-    totals: Dict[str, Dict[str, float]] = {}
-    total_pos = 0
+    lines = [f"📈 *Summary — {login.label}*\n_{len(accounts)} account(s)_"]
 
     for _, acc in accounts.iterrows():
         acc_id = acc.get("accountId")
@@ -631,7 +573,6 @@ def build_summary_all_in_login(login: IGLogin) -> str:
             n_pos = 0 if positions is None or positions.empty else len(positions)
         except Exception:
             n_pos = -1
-        total_pos += max(n_pos, 0)
 
         emoji = "🟢" if pnl >= 0 else "🔴"
         n_str = "?" if n_pos < 0 else str(n_pos)
@@ -642,26 +583,12 @@ def build_summary_all_in_login(login: IGLogin) -> str:
             f"Avail: `{fmt_money(available, currency)}`"
         )
 
-        t = totals.setdefault(currency, {"balance": 0.0, "available": 0.0, "pnl": 0.0})
-        t["balance"] += balance
-        t["available"] += available
-        t["pnl"] += pnl
-
-    lines.append(f"\n━━━━━━━━━━\n*Totals* — {total_pos} pos")
-    for cur, t in totals.items():
-        emoji = "🟢" if t["pnl"] >= 0 else "🔴"
-        lines.append(
-            f"   Bal: `{fmt_money(t['balance'], cur)}`  •  "
-            f"Avail: `{fmt_money(t['available'], cur)}`  •  "
-            f"{emoji} `{fmt_money(t['pnl'], cur)}`"
-        )
     return "\n".join(lines)
 
 
 def build_summary_all_logins() -> str:
-    lines = ["📈 *Summary — All Logins*"]
-    grand: Dict[str, Dict[str, float]] = {}
-    grand_pos = 0
+    """Show every account separately across all logins, no totals."""
+    lines = [f"📈 *Summary — All Logins*\n_{len(registry.logins)} login(s)_"]
 
     for _, login in registry.enumerate():
         try:
@@ -673,46 +600,32 @@ def build_summary_all_logins() -> str:
             lines.append(f"\n═══════════════\n🔐 *{login.label}*\n_no accounts_")
             continue
 
-        per: Dict[str, Dict[str, float]] = {}
-        login_pos = 0
+        lines.append(f"\n═══════════════\n🔐 *{login.label}*")
+
         for _, acc in accounts.iterrows():
             acc_id = acc.get("accountId")
+            label = acc_label(acc, short=True)
             currency = acc.get("currency", "")
             balance = float(acc.get("balance", 0) or 0)
             available = float(acc.get("available", 0) or 0)
             pnl = float(acc.get("profitLoss", 0) or 0)
+
             try:
                 login.call("switch_account", acc_id, False)
                 positions = login.call("fetch_open_positions")
                 n_pos = 0 if positions is None or positions.empty else len(positions)
             except Exception:
-                n_pos = 0
-            login_pos += n_pos
-            grand_pos += n_pos
+                n_pos = -1
 
-            for d in (per, grand):
-                t = d.setdefault(currency, {"balance": 0.0, "available": 0.0, "pnl": 0.0})
-                t["balance"] += balance
-                t["available"] += available
-                t["pnl"] += pnl
-
-        lines.append(f"\n═══════════════\n🔐 *{login.label}* ({len(accounts)} acc, {login_pos} pos)")
-        for cur, t in per.items():
-            emoji = "🟢" if t["pnl"] >= 0 else "🔴"
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            n_str = "?" if n_pos < 0 else str(n_pos)
             lines.append(
-                f"   Bal: `{fmt_money(t['balance'], cur)}`  •  "
-                f"Avail: `{fmt_money(t['available'], cur)}`  •  "
-                f"{emoji} `{fmt_money(t['pnl'], cur)}`"
+                f"\n*{label}*\n"
+                f"   Pos: *{n_str}*  •  {emoji} `{fmt_money(pnl, currency)}`\n"
+                f"   Bal: `{fmt_money(balance, currency)}`  •  "
+                f"Avail: `{fmt_money(available, currency)}`"
             )
 
-    lines.append(f"\n━━━━━━━━━━\n*GRAND TOTALS* — {grand_pos} pos")
-    for cur, t in grand.items():
-        emoji = "🟢" if t["pnl"] >= 0 else "🔴"
-        lines.append(
-            f"   Bal: `{fmt_money(t['balance'], cur)}`  •  "
-            f"Avail: `{fmt_money(t['available'], cur)}`  •  "
-            f"{emoji} `{fmt_money(t['pnl'], cur)}`"
-        )
     return "\n".join(lines)
 
 
