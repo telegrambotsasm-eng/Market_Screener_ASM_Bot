@@ -1,6 +1,6 @@
 """
 IG Markets Spread Betting - Telegram Reporting Bot
-Multi-login + multi-account support, button-driven UI.
+Multi-login + multi-account support with banner images.
 """
 
 import os
@@ -15,7 +15,12 @@ from typing import Optional, Tuple, List, Dict, Any
 warnings.filterwarnings("ignore", message=".*munch.*")
 
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -42,12 +47,30 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ALLOWED_CHAT_ID = int(os.environ["ALLOWED_CHAT_ID"])
 
-MAX_TG_MSG = 4000  # Telegram limit is 4096; leave headroom
+MAX_TG_CAPTION = 1000  # Telegram caption limit is 1024 — leave headroom
+MAX_TG_MSG = 4000      # Plain message limit is 4096
+
+# ---------- Banner paths ----------
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+
+BANNERS = {
+    "main": os.path.join(ASSETS_DIR, "banner_main.png"),
+    "positions": os.path.join(ASSETS_DIR, "banner_positions.png"),
+    "balance": os.path.join(ASSETS_DIR, "banner_balance.png"),
+    "summary": os.path.join(ASSETS_DIR, "banner_summary.png"),
+    "accounts": os.path.join(ASSETS_DIR, "banner_accounts.png"),
+    "picker_login": os.path.join(ASSETS_DIR, "banner_picker_login.png"),
+    "picker_account": os.path.join(ASSETS_DIR, "banner_picker_account.png"),
+    "error": os.path.join(ASSETS_DIR, "banner_error.png"),
+}
+
+# Cache for uploaded banner file_ids — first send uploads the file,
+# every subsequent send just references the cached file_id (much faster).
+_banner_file_ids: Dict[str, str] = {}
 
 
 # ---------- Login configuration ----------
 def load_logins() -> List[Dict[str, Any]]:
-    """Load multiple IG logins from the IG_LOGINS env var (JSON array)."""
     raw = os.environ.get("IG_LOGINS", "").strip()
     if not raw:
         print("=" * 60, file=sys.stderr)
@@ -55,7 +78,6 @@ def load_logins() -> List[Dict[str, Any]]:
         print("Set it to a JSON array, e.g.:", file=sys.stderr)
         print('   [{"label":"Demo","username":"X","password":"Y","api_key":"Z","acc_type":"DEMO"}]', file=sys.stderr)
         print("=" * 60, file=sys.stderr)
-        # Sleep forever instead of crash-looping
         import time; time.sleep(3600)
         raise SystemExit(1)
 
@@ -66,7 +88,6 @@ def load_logins() -> List[Dict[str, Any]]:
         print(f"❌ IG_LOGINS is not valid JSON: {e}", file=sys.stderr)
         print("First 200 chars of what you set:", file=sys.stderr)
         print(f"   {raw[:200]!r}", file=sys.stderr)
-        print("Tip: make sure quotes are straight \" not curly \u201c \u201d", file=sys.stderr)
         print("=" * 60, file=sys.stderr)
         import time; time.sleep(3600)
         raise SystemExit(1)
@@ -89,8 +110,7 @@ def load_logins() -> List[Dict[str, Any]]:
             print("=" * 60, file=sys.stderr)
             print(f"❌ IG_LOGINS[{i}] is missing required field(s): {missing}", file=sys.stderr)
             print(f"   Fields I found in this entry: {keys_seen}", file=sys.stderr)
-            print(f"   Required field names (exact, case-sensitive): {list(REQUIRED)}", file=sys.stderr)
-            print(f"   Optional: 'label', 'acc_type'", file=sys.stderr)
+            print(f"   Required (exact, case-sensitive): {list(REQUIRED)}", file=sys.stderr)
             print("=" * 60, file=sys.stderr)
             import time; time.sleep(3600)
             raise SystemExit(1)
@@ -101,7 +121,7 @@ def load_logins() -> List[Dict[str, Any]]:
     return data
 
 
-# ---------- One IG login session ----------
+# ---------- IG session ----------
 class IGLogin:
     def __init__(self, cfg: Dict[str, Any]) -> None:
         self.label: str = cfg["label"]
@@ -135,7 +155,6 @@ class IGLogin:
             raise
 
 
-# ---------- Registry ----------
 class Registry:
     def __init__(self, configs: List[Dict[str, Any]]) -> None:
         self.logins: List[IGLogin] = [IGLogin(c) for c in configs]
@@ -177,20 +196,11 @@ def acc_label(acc_row, short: bool = False) -> str:
     return f"{star}{name}" if short else f"{star}{name} ({acc_type})"
 
 
-def truncate(text: str) -> str:
-    if len(text) <= MAX_TG_MSG:
-        return text
-    return text[:MAX_TG_MSG] + "\n\n_... (output truncated)_"
-
-
-def grand_totals_text(totals: Dict[str, float], heading: str) -> str:
-    if not totals:
-        return ""
-    lines = [f"\n\n━━━━━━━━━━\n*{heading}*"]
-    for cur, val in totals.items():
-        emoji = "🟢" if val >= 0 else "🔴"
-        lines.append(f"{emoji} `{fmt_money(val, cur)}`")
-    return "\n".join(lines)
+def truncate_for_caption(text: str) -> Tuple[str, bool]:
+    """Returns (text, fits_in_caption). If too long, caller should send as plain text."""
+    if len(text) <= MAX_TG_CAPTION:
+        return text, True
+    return text, False
 
 
 # ---------- Keyboards ----------
@@ -205,8 +215,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📈 Summary", callback_data="pick:summary"),
                 InlineKeyboardButton("🏦 Accounts", callback_data="accounts"),
             ],
-            [InlineKeyboardButton("🏓 Ping", callback_data="ping")],
-            [InlineKeyboardButton("🔄 Refresh menu", callback_data="menu")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="menu")],
         ]
     )
 
@@ -267,7 +276,6 @@ def simple_result_keyboard() -> InlineKeyboardMarkup:
 
 
 MENU_TEXT = (
-    "🤖 *IG Spread Bet Reporter*\n\n"
     f"_{len(registry.logins)} login(s) configured._\n\n"
     "Tap a button below to see your account info."
 )
@@ -275,7 +283,6 @@ MENU_TEXT = (
 
 # ---------- Position formatting ----------
 def format_positions_df(df) -> Tuple[str, float, int, str]:
-    """Format a positions dataframe. Returns (body, total_pnl, count, currency)."""
     if df is None or df.empty:
         return ("_no open positions_", 0.0, 0, "")
 
@@ -343,7 +350,7 @@ def build_positions_one(login: IGLogin, account_id: str) -> str:
         if not m.empty:
             name = acc_label(m.iloc[0], short=True)
 
-    header = f"📊 *Open positions*\n🔐 _Login:_ {login.label}\n🏦 _Account:_ {name}\n"
+    header = f"🔐 _Login:_ {login.label}\n🏦 _Account:_ {name}\n"
     if count == 0:
         return header + "\n📭 _No open positions_"
     emoji = "🟢" if total_pnl >= 0 else "🔴"
@@ -379,12 +386,11 @@ def build_positions_all_in_login(login: IGLogin) -> str:
             section += f"\n\n{emoji} _Account P&L:_ `{fmt_money(pnl, currency)}`"
         sections.append(section)
 
-    header = f"📊 *{login.label}* — {grand_count} open position(s)\n"
+    header = f"*{login.label}* — {grand_count} open position(s)\n"
     return header + "\n\n".join(sections)
 
 
 def build_positions_all_logins() -> str:
-    """Compact view: per login, per account. Counts and per-account P&L only — no totals across accounts."""
     sections = []
     grand_count = 0
 
@@ -430,7 +436,7 @@ def build_positions_all_logins() -> str:
         )
         sections.append(section)
 
-    header = f"📊 *All Logins* — {grand_count} open position(s) total\n"
+    header = f"*All Logins* — {grand_count} open position(s) total\n"
     return header + "\n\n".join(sections)
 
 
@@ -470,26 +476,23 @@ def build_balance_one(login: IGLogin, account_id: str) -> str:
     m = accounts[accounts["accountId"] == account_id]
     if m.empty:
         return f"Account `{account_id}` not found in '{login.label}'."
-    return f"💼 *Balance*\n🔐 _Login:_ {login.label}\n\n" + format_balance_row(m.iloc[0])
+    return f"🔐 _Login:_ {login.label}\n\n" + format_balance_row(m.iloc[0])
 
 
 def build_balance_all_in_login(login: IGLogin) -> str:
     accounts = login.call("fetch_accounts")
     if accounts is None or accounts.empty:
         return f"No accounts in '{login.label}'."
-
     sections = [format_balance_row(acc) for _, acc in accounts.iterrows()]
     return (
-        f"💼 *{login.label}*\n_{len(accounts)} account(s)_\n\n"
+        f"*{login.label}* — _{len(accounts)} account(s)_\n\n"
         + "\n\n".join(sections)
     )
 
 
 def build_balance_all_logins() -> str:
-    """Show every account separately, no totals (CFD vs Spread Bet should never be summed)."""
     sections = []
     total_accounts = 0
-
     for _, login in registry.enumerate():
         try:
             accounts = login.call("fetch_accounts")
@@ -499,15 +502,13 @@ def build_balance_all_logins() -> str:
         if accounts is None or accounts.empty:
             sections.append(f"═══════════════\n🔐 *{login.label}*\n_no accounts_")
             continue
-
         total_accounts += len(accounts)
         parts = [f"═══════════════\n🔐 *{login.label}*"]
         for _, acc in accounts.iterrows():
             parts.append("")
             parts.append(format_balance_row(acc))
         sections.append("\n".join(parts))
-
-    header = f"💼 *All Logins — Balance*\n_{len(registry.logins)} login(s), {total_accounts} account(s)_\n"
+    header = f"_{len(registry.logins)} login(s), {total_accounts} account(s)_\n"
     return header + "\n\n".join(sections)
 
 
@@ -544,7 +545,7 @@ def build_summary_one(login: IGLogin, account_id: str) -> str:
     emoji = "🟢" if pnl >= 0 else "🔴"
 
     return (
-        f"📈 *Summary*\n🔐 _Login:_ {login.label}\n🏦 _Account:_ {name}\n\n"
+        f"🔐 _Login:_ {login.label}\n🏦 _Account:_ {name}\n\n"
         f"Open positions: *{n_pos}*\n"
         f"Balance: `{fmt_money(balance, currency)}`\n"
         f"Available: `{fmt_money(available, currency)}`\n"
@@ -557,7 +558,7 @@ def build_summary_all_in_login(login: IGLogin) -> str:
     if accounts is None or accounts.empty:
         return f"No accounts in '{login.label}'."
 
-    lines = [f"📈 *Summary — {login.label}*\n_{len(accounts)} account(s)_"]
+    lines = [f"*{login.label}* — _{len(accounts)} account(s)_"]
 
     for _, acc in accounts.iterrows():
         acc_id = acc.get("accountId")
@@ -566,14 +567,12 @@ def build_summary_all_in_login(login: IGLogin) -> str:
         balance = float(acc.get("balance", 0) or 0)
         available = float(acc.get("available", 0) or 0)
         pnl = float(acc.get("profitLoss", 0) or 0)
-
         try:
             login.call("switch_account", acc_id, False)
             positions = login.call("fetch_open_positions")
             n_pos = 0 if positions is None or positions.empty else len(positions)
         except Exception:
             n_pos = -1
-
         emoji = "🟢" if pnl >= 0 else "🔴"
         n_str = "?" if n_pos < 0 else str(n_pos)
         lines.append(
@@ -582,13 +581,11 @@ def build_summary_all_in_login(login: IGLogin) -> str:
             f"   Bal: `{fmt_money(balance, currency)}`  •  "
             f"Avail: `{fmt_money(available, currency)}`"
         )
-
     return "\n".join(lines)
 
 
 def build_summary_all_logins() -> str:
-    """Show every account separately across all logins, no totals."""
-    lines = [f"📈 *Summary — All Logins*\n_{len(registry.logins)} login(s)_"]
+    lines = [f"_{len(registry.logins)} login(s)_"]
 
     for _, login in registry.enumerate():
         try:
@@ -601,7 +598,6 @@ def build_summary_all_logins() -> str:
             continue
 
         lines.append(f"\n═══════════════\n🔐 *{login.label}*")
-
         for _, acc in accounts.iterrows():
             acc_id = acc.get("accountId")
             label = acc_label(acc, short=True)
@@ -609,14 +605,12 @@ def build_summary_all_logins() -> str:
             balance = float(acc.get("balance", 0) or 0)
             available = float(acc.get("available", 0) or 0)
             pnl = float(acc.get("profitLoss", 0) or 0)
-
             try:
                 login.call("switch_account", acc_id, False)
                 positions = login.call("fetch_open_positions")
                 n_pos = 0 if positions is None or positions.empty else len(positions)
             except Exception:
                 n_pos = -1
-
             emoji = "🟢" if pnl >= 0 else "🔴"
             n_str = "?" if n_pos < 0 else str(n_pos)
             lines.append(
@@ -625,7 +619,6 @@ def build_summary_all_logins() -> str:
                 f"   Bal: `{fmt_money(balance, currency)}`  •  "
                 f"Avail: `{fmt_money(available, currency)}`"
             )
-
     return "\n".join(lines)
 
 
@@ -655,12 +648,125 @@ def build_accounts_list() -> str:
             )
         sections.append(f"═══════════════\n🔐 *{login.label}*\n" + "\n".join(acc_lines))
 
-    header = f"🏦 *All accounts*\n{len(registry.logins)} login(s), {total} account(s)\n"
+    header = f"_{len(registry.logins)} login(s), {total} account(s)_\n"
     return header + "\n\n".join(sections)
 
 
-def build_ping() -> str:
-    return f"🏓 *pong*\nServer time: `{datetime.utcnow():%Y-%m-%d %H:%M:%S} UTC`"
+# ============================================================
+# BANNER MESSAGE HELPERS
+# ============================================================
+async def send_or_edit_banner(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    banner_key: str,
+    text: str,
+    keyboard: InlineKeyboardMarkup,
+) -> None:
+    """
+    Display content with the right banner. Tries to edit the current message
+    in place; falls back to deleting + sending a new one when needed.
+
+    If the text doesn't fit in a 1024-char caption, sends as plain text (no banner).
+    """
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    banner_path = BANNERS.get(banner_key)
+    fits_caption = len(text) <= MAX_TG_CAPTION
+    is_callback = update.callback_query is not None
+
+    # If text is too long for a caption, send/edit as plain text
+    if not fits_caption:
+        text_to_send = text[:MAX_TG_MSG] if len(text) > MAX_TG_MSG else text
+        if is_callback:
+            try:
+                await update.callback_query.edit_message_text(
+                    text_to_send,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=keyboard,
+                )
+                return
+            except Exception as e:
+                msg = str(e).lower()
+                if "not modified" in msg:
+                    await update.callback_query.answer("Already up to date ✓")
+                    return
+                # Message was a photo — can't edit caption to plain text. Delete + resend.
+                try:
+                    await update.callback_query.message.delete()
+                except Exception:
+                    pass
+        await chat.send_message(text_to_send, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        return
+
+    # Text fits — try to use a banner
+    if banner_path and os.path.exists(banner_path):
+        cached_id = _banner_file_ids.get(banner_key)
+        media_source = cached_id if cached_id else open(banner_path, "rb")
+
+        try:
+            if is_callback:
+                # Try to edit current message's media to this banner with new caption
+                try:
+                    sent = await update.callback_query.edit_message_media(
+                        media=InputMediaPhoto(
+                            media=media_source,
+                            caption=text,
+                            parse_mode=ParseMode.MARKDOWN,
+                        ),
+                        reply_markup=keyboard,
+                    )
+                    # Cache file_id after first upload
+                    if not cached_id and sent and sent.photo:
+                        _banner_file_ids[banner_key] = sent.photo[-1].file_id
+                    return
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "not modified" in msg:
+                        await update.callback_query.answer("Already up to date ✓")
+                        return
+                    # Previous message wasn't a photo (e.g. very first /start sent plain),
+                    # or some other edit failure — delete and resend.
+                    try:
+                        await update.callback_query.message.delete()
+                    except Exception:
+                        pass
+                    # Reopen file if needed (it may have been consumed)
+                    if not isinstance(media_source, str):
+                        media_source = open(banner_path, "rb")
+
+            # Fresh send (either /start or fallback from a failed edit)
+            sent = await chat.send_photo(
+                photo=media_source,
+                caption=text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard,
+            )
+            if not cached_id and sent.photo:
+                _banner_file_ids[banner_key] = sent.photo[-1].file_id
+            return
+        finally:
+            # Close file handle if we opened one
+            if not isinstance(media_source, str):
+                try:
+                    media_source.close()
+                except Exception:
+                    pass
+
+    # No banner available — fall back to plain text
+    if is_callback:
+        try:
+            await update.callback_query.edit_message_text(
+                text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+            )
+            return
+        except Exception:
+            try:
+                await update.callback_query.message.delete()
+            except Exception:
+                pass
+    await chat.send_message(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
 
 # ============================================================
@@ -671,56 +777,48 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message:
             await update.message.reply_text("⛔ Access denied.")
         return
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            MENU_TEXT, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard()
-        )
-    elif update.message:
-        await update.message.reply_text(
-            MENU_TEXT, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard()
-        )
+    await send_or_edit_banner(update, context, "main", MENU_TEXT, main_menu_keyboard())
 
 
-async def safe_edit(query, text: str, keyboard: InlineKeyboardMarkup) -> None:
-    try:
-        await query.edit_message_text(
-            truncate(text), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
-        )
-    except Exception as e:
-        if "not modified" in str(e).lower():
-            await query.answer("Already up to date ✓")
-        else:
-            raise
+async def show_login_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str) -> None:
+    text = f"_Pick a login for {action.title()}_"
+    await send_or_edit_banner(
+        update, context, "picker_login", text, login_picker_keyboard(action)
+    )
 
 
-async def show_login_picker(query, action: str) -> None:
-    text = f"📂 *Choose a login for {action.title()}:*"
-    await safe_edit(query, text, login_picker_keyboard(action))
-
-
-async def show_account_picker(query, action: str, login_idx) -> None:
+async def show_account_picker(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, login_idx
+) -> None:
     login = registry.by_idx(login_idx)
     try:
         accounts = login.call("fetch_accounts")
     except Exception as e:
-        await safe_edit(
-            query, f"❌ Error fetching accounts from '{login.label}':\n`{e}`",
+        await send_or_edit_banner(
+            update,
+            context,
+            "error",
+            f"❌ Error fetching accounts from *{login.label}*:\n`{e}`",
             main_menu_keyboard(),
         )
         return
-    text = f"📂 *Choose an account*\n🔐 _Login:_ {login.label}\n_Action:_ {action.title()}"
-    await safe_edit(query, text, account_picker_keyboard(action, int(login_idx), accounts))
+    text = f"🔐 _Login:_ *{login.label}*\n_Action:_ {action.title()}\n\n_Pick an account_"
+    await send_or_edit_banner(
+        update, context, "picker_account", text,
+        account_picker_keyboard(action, int(login_idx), accounts),
+    )
 
 
-async def run_action(query, action: str, login_idx, account_id: str) -> None:
-    # Slow operations: show a loading state first
+async def run_action(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    action: str, login_idx, account_id: str,
+) -> None:
+    query = update.callback_query
+    # Show a "loading" state for slow operations
     is_slow = login_idx == "ALL"
-    if is_slow:
+    if is_slow and query:
         try:
-            await query.edit_message_text(
-                "⏳ *Fetching across all logins...*",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            await query.answer("⏳ Fetching across all logins...", show_alert=False)
         except Exception:
             pass
 
@@ -735,9 +833,28 @@ async def run_action(query, action: str, login_idx, account_id: str) -> None:
             text = "Unknown action."
     except Exception as e:
         logger.exception("Action %s failed", action)
-        text = f"❌ *Error*\n`{e}`"
+        await send_or_edit_banner(
+            update, context, "error",
+            f"*Error*\n`{e}`",
+            result_keyboard(action, login_idx),
+        )
+        return
 
-    await safe_edit(query, text, result_keyboard(action, login_idx))
+    await send_or_edit_banner(update, context, action, text, result_keyboard(action, login_idx))
+
+
+async def show_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        text = build_accounts_list()
+    except Exception as e:
+        logger.exception("accounts list failed")
+        await send_or_edit_banner(
+            update, context, "error",
+            f"*Error*\n`{e}`",
+            simple_result_keyboard(),
+        )
+        return
+    await send_or_edit_banner(update, context, "accounts", text, simple_result_keyboard())
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -758,65 +875,39 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         last_login = context.user_data.get("last_login_idx")
         last_acc = context.user_data.get("last_account_id")
 
-        if last_action == "ping":
-            await safe_edit(query, build_ping(), simple_result_keyboard())
-        elif last_action == "accounts":
-            try:
-                text = build_accounts_list()
-            except Exception as e:
-                text = f"❌ *Error*\n`{e}`"
-            await safe_edit(query, text, simple_result_keyboard())
+        if last_action == "accounts":
+            await show_accounts(update, context)
         elif last_action in ("positions", "balance", "summary") and last_login is not None:
-            await run_action(query, last_action, last_login, last_acc)
+            await run_action(update, context, last_action, last_login, last_acc)
         else:
             await show_menu(update, context)
         return
 
     if data.startswith("pick:"):
         action = data.split(":", 1)[1]
-        await show_login_picker(query, action)
+        await show_login_picker(update, context, action)
         return
 
     if data.startswith("pickacc:"):
         _, action, login_idx = data.split(":", 2)
-        await show_account_picker(query, action, login_idx)
+        await show_account_picker(update, context, action, login_idx)
         return
 
     if data.startswith("run:"):
-        # run:action:login_idx:account_id    (login_idx can be int or "ALL", account_id can be id or "ALL")
         _, action, login_idx, account_id = data.split(":", 3)
-        # Normalize: if int, keep as string for consistency, but we need int for indexing
         if login_idx != "ALL":
             login_idx = int(login_idx)
         context.user_data["last_action"] = action
         context.user_data["last_login_idx"] = login_idx
         context.user_data["last_account_id"] = account_id
-        await run_action(query, action, login_idx, account_id)
-        return
-
-    if data == "ping":
-        context.user_data["last_action"] = "ping"
-        context.user_data["last_login_idx"] = None
-        context.user_data["last_account_id"] = None
-        await safe_edit(query, build_ping(), simple_result_keyboard())
+        await run_action(update, context, action, login_idx, account_id)
         return
 
     if data == "accounts":
         context.user_data["last_action"] = "accounts"
         context.user_data["last_login_idx"] = None
         context.user_data["last_account_id"] = None
-        try:
-            await query.edit_message_text(
-                "⏳ *Loading accounts...*", parse_mode=ParseMode.MARKDOWN
-            )
-        except Exception:
-            pass
-        try:
-            text = build_accounts_list()
-        except Exception as e:
-            logger.exception("accounts list failed")
-            text = f"❌ *Error*\n`{e}`"
-        await safe_edit(query, text, simple_result_keyboard())
+        await show_accounts(update, context)
         return
 
     await show_menu(update, context)
@@ -836,7 +927,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_any_text))
     app.add_handler(MessageHandler(filters.COMMAND, on_any_text))
 
-    logger.info("Bot starting with %d login(s) configured.", len(registry.logins))
+    logger.info("Bot starting with %d login(s).", len(registry.logins))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
