@@ -959,6 +959,7 @@ IG_REASON_MESSAGES = {
     "MARKET_CLOSED_WITH_EDITS": "🕐 Market closed (no edits allowed)",
     "MARKET_OFFLINE": "📴 Market is offline",
     "MARKET_NOT_BORROWABLE": "🚫 Market not available for shorting",
+    "NOT_SUPPORTED_FOR_EPIC": "⚠️ Order type not supported for this instrument",
     "INSUFFICIENT_FUNDS": "💸 Insufficient funds",
     "MANUAL_ORDER_TIMEOUT": "⏱ Manual order timed out (dealer review)",
     "POSITION_NOT_AVAILABLE_TO_CLOSE": "❓ Position not available to close (already closed?)",
@@ -1044,39 +1045,52 @@ def extract_close_result(result: Any) -> Tuple[bool, str, str]:
 
 def close_position(login: IGLogin, position_row) -> Tuple[bool, str]:
     """
-    Close a single open position using the IG REST close-otc endpoint.
-    Returns (success, message). 'position_row' is one row from fetch_open_positions().
+    Close a single open position by opening an opposite position with
+    force_open=False. IG nets opposing positions on the same instrument,
+    which effectively closes the original. This is what IG's web UI does
+    and it works on all instrument types including daily options.
     """
     f = extract_position_fields(position_row)
     deal_id = f["deal_id"]
     direction = f["direction"]
     size = f["size"]
     name = f["instrument_name"]
+    epic = f["epic"]
+    expiry = f["expiry"] or "-"
+    currency = f["currency"] or "GBP"
 
     if not deal_id:
-        return False, f"*{name}*: ❌ missing dealId"
+        return False, f"*{name}*: \u274c missing dealId"
     if size <= 0:
-        return False, f"*{name}*: ❌ size is 0 (could not read from IG response)"
+        return False, f"*{name}*: \u274c size is 0 (could not read from IG response)"
+    if not epic:
+        return False, f"*{name}*: \u274c no epic"
 
     opposite = "SELL" if direction == "BUY" else "BUY"
 
     try:
         result = login.call(
-            "close_open_position",
-            deal_id=deal_id,
+            "create_open_position",
+            currency_code=currency,
             direction=opposite,
-            epic=None,
-            expiry=None,
+            epic=epic,
+            expiry=expiry,
+            force_open=False,   # critical: lets IG net against existing position
+            guaranteed_stop=False,
             level=None,
+            limit_distance=None,
+            limit_level=None,
             order_type="MARKET",
             quote_id=None,
             size=size,
+            stop_distance=None,
+            stop_level=None,
+            trailing_stop=False,
+            trailing_stop_increment=None,
         )
     except Exception as e:
-        # Network / library error
         err_text = str(e)
-        logger.exception("close_position EXCEPTION for %s: %s", name, err_text)
-        # Try to extract the reason from the exception message (IG sometimes embeds it)
+        logger.exception("close_position failed for %s: %s", name, err_text)
         reason_msg = ""
         for code in IG_REASON_MESSAGES:
             if code in err_text.upper():
@@ -1084,25 +1098,22 @@ def close_position(login: IGLogin, position_row) -> Tuple[bool, str]:
                 break
         if reason_msg:
             return False, f"*{name}*: {reason_msg}"
-        # Strip noisy parts of common error messages
         short = err_text.split("\n")[0][:160]
-        return False, f"*{name}*: ❌ `{short}`"
+        return False, f"*{name}*: \u274c `{short}`"
 
     success, status, reason = extract_close_result(result)
     logger.info(
         "close_position result for %s: success=%s status=%s reason=%s raw=%r",
         name, success, status, reason, result,
     )
-
     if success:
-        return True, f"*{name}*: ✅ closed"
-
-    # Failed — give the best explanation we can
+        return True, f"*{name}*: \u2705 closed"
     if reason:
         return False, f"*{name}*: {explain_ig_reason(reason)}"
     if status and status != "REJECTED":
-        return False, f"*{name}*: ❌ status `{status}`"
-    return False, f"*{name}*: ❌ rejected (no reason given by IG)"
+        return False, f"*{name}*: \u274c status `{status}`"
+    return False, f"*{name}*: \u274c rejected (no reason given by IG)"
+
 
 
 def close_all_in_account(login: IGLogin, account_id: str) -> Tuple[int, int, List[str]]:
